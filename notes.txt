@@ -1,0 +1,95 @@
+simple static HTML generator
+
+Goals:
+ - very close to vanilla HTML, text editor for HTML should remain usable
+   and should be the primary means of authoring content
+ - simple mechanism for inlining other HTML documents and generating
+   content based on self-explanatory patterns
+    Motivating examples:
+     - including the tab menu / banner at the top of every page
+     - surrounding all pages with the backdrop
+     - reusable elements for arranging sections, headings, and content
+     - reusable elements for arranging images, e.g. in grid
+
+###################################################3
+Approach #1
+
+when writing html, allow adding what looks like custom html tags that get
+substituted at build time with vanilla html content generated from files
+of the same name.
+
+Example:
+.
+|-- public/
+|   |-- index.html
+|       :   <html>
+|       :       <body>
+|       :           <toptabmenu/>
+|       :           <p>
+|       :               Hello world
+|       :           </p>
+|       :       </body>
+|       :   </html>
+|-- elements/
+    |-- toptabmenu.html
+        :   <div class="tabmenu">
+        :       <div class="tabmenutab">About Me</div>
+        :       <div class="tabmenutab">Machine Learning</div>
+        :       <div class="tabmenutab">Audio</div>
+        :   </div>
+
+When building, the site generator visits every html file in the public/ directory,
+parses the file, and substitutes non-standard elements depth-first with the
+contents defined in the correspondingly named file under the elements/ directory.
+Recursion is not allowed and triggers an error.
+
+In order to allow generalizing container-style elements, a mechanism is needed for
+referencing the content and/or children of an element.
+
+Hmmmmm:
+.
+|-- public/
+|   |-- index.html
+|       :   <html>
+|       :       <body>
+|       :           <fancyparagraph title="Hello World">
+|       :               Oh would you look at the time
+|       :           </fancyparagraph>
+|       :           <fancylist>
+|       :               <item>One</item>
+|       :               <item>Two</item>
+|       :               <item>Three</item>
+|       :           </fancylist>
+|       :       </body>
+|       :   </html>
+|-- elements/
+    |-- fancyparagraph.html
+    |   :   <div>
+    |   :       <h3>
+    |   :           <!-- Access the 'title' attribute of the fancyparagraph tag -->
+    |   :           <self.title/>
+    |   :       </h3>
+    |   :       <p>
+    |   :           <!-- Access the inner html of the fancyparagraph tag -->
+    |   :           <self.inner/>
+    |   :       </p>
+    |   :   </div>
+    |-- fancylist.html
+    |   :   <ul style="fancy fancy css stuff">
+    |   :       <foreach item x in self>
+    |   :           <li style="more fanciness">
+    |   :               <x />
+    |   :           </li>
+    |   :       </foreach>
+    |   :   </ul>
+    |-- fancylist.item.html
+        :   <span style="oh so fancy>
+        :       <self.inner/>
+        :   </span>
+
+Ideally, the system should
+    1. Look like vanilla html so that it remains readable by humans and text editors
+    2. Provide a straight-forward and self-explanatory mechanism for deduplicating
+       html and avoiding manual copy/paste.
+    3. Work with and preserve all aspects of an existing and unmodified static html site
+
