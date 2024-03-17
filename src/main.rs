@@ -2,6 +2,84 @@ use std::{collections::HashMap, fs, io, path};
 
 use clap::Parser;
 
+// Look for and replace single instances of a named tag with
+// the given replacement
+fn substitute_tag(
+    node: html_parser::Node,
+    tag_name: &str,
+    replacement: &html_parser::Node,
+) -> html_parser::Node {
+    let html_parser::Node::Element(mut elem) = node else {
+        return node;
+    };
+    if elem.name == tag_name {
+        return replacement.clone();
+    }
+    for child in &mut elem.children {
+        // TODO: avoid this clone
+        *child = substitute_tag(child.clone(), tag_name, replacement);
+    }
+    html_parser::Node::Element(elem)
+}
+
+// Process a list of nodes, recursively substituting and applying rules,
+// and return the resulting list of nodes, which may have shrunk or grown.
+fn substitute_invocation(
+    nodes: Vec<html_parser::Node>,
+    invocation: &html_parser::Element,
+) -> Vec<html_parser::Node> {
+    nodes
+        .into_iter()
+        .map(|node| -> Vec<html_parser::Node> {
+            // comments and text get passed through unmodified
+            let html_parser::Node::Element(mut elem) = node else {
+                return vec![node];
+            };
+
+            // substitute innermost elements
+            let children = std::mem::replace(&mut elem.children, vec![]);
+            elem.children = substitute_invocation(children, invocation);
+
+            // substitute foreach tags
+            if elem.name == "foreachchild" {
+                assert!(elem.attributes.len() == 1);
+                let (loop_var, val) = elem.attributes.iter().next().unwrap().clone();
+                assert!(val.is_none());
+                assert!(elem.children.len() == 1);
+                return invocation
+                    .children
+                    .iter()
+                    .map(|inv_child| {
+                        let n = substitute_tag(elem.children[0].clone(), &loop_var, &inv_child);
+                        n
+                    })
+                    .collect();
+            }
+
+            // Look for tags of the form <self.xyz>
+            let Some(attr_name) = elem.name.strip_prefix("self.") else {
+                // Pass the node through unmodified otherwise
+                return vec![html_parser::Node::Element(elem)];
+            };
+            if attr_name == "inner" {
+                // replace tags <self.inner> with the node's children
+                invocation.children.clone()
+            } else if let Some(attr_val) = invocation.attributes.get(attr_name) {
+                // replace tags <self.xyz> with attribute value xyz if defined
+                if let Some(attr_val) = attr_val {
+                    vec![html_parser::Node::Text(attr_val.to_string())]
+                } else {
+                    vec![]
+                }
+            } else {
+                println!("Warning: undefined attribute <self.{}>", attr_name);
+                vec![]
+            }
+        })
+        .flatten()
+        .collect()
+}
+
 struct ElementDefinition {
     tag_name: String,
     node: html_parser::Node,
@@ -25,13 +103,15 @@ impl ElementDefinition {
         &self.tag_name
     }
 
-    fn instantiate(&self) -> html_parser::Node {
-        // TODO:
-        // - accept and substitute attributes
-        // - accept and substitute children
-        // - generate and return new VDomGuard (or just string?)
+    fn instantiate(&self, invocation: &html_parser::Element) -> html_parser::Node {
+        let mut node = self.node.clone();
 
-        self.node.clone()
+        if let html_parser::Node::Element(ref mut node) = &mut node {
+            let children = std::mem::replace(&mut node.children, vec![]);
+            node.children = substitute_invocation(children, invocation);
+        }
+
+        node
     }
 }
 
@@ -66,6 +146,8 @@ fn substitute(node: &mut html_parser::Node, library: &ElementLibrary) -> bool {
         return false;
     };
 
+    let mut any_substitutions = false;
+
     loop {
         let mut did_anything = false;
         for child in &mut element.children {
@@ -82,7 +164,7 @@ fn substitute(node: &mut html_parser::Node, library: &ElementLibrary) -> bool {
 
     if let Some(element_defn) = library.elements().get(&element_name) {
         // TODO: do the substitution
-        *node = element_defn.instantiate();
+        *node = element_defn.instantiate(&element);
 
         assert!(
             if let html_parser::Node::Element(e) = node {
@@ -92,10 +174,26 @@ fn substitute(node: &mut html_parser::Node, library: &ElementLibrary) -> bool {
             },
             "Node was not substituted"
         );
-        true
-    } else {
-        false
+
+        any_substitutions = true;
     }
+
+    if let html_parser::Node::Element(element) = node {
+        loop {
+            let mut did_anything = false;
+            for child in &mut element.children {
+                if substitute(child, library) {
+                    did_anything = true;
+                    any_substitutions = true;
+                }
+            }
+            if !did_anything {
+                break;
+            }
+        }
+    }
+
+    any_substitutions
 }
 
 fn generate_file(
@@ -118,8 +216,11 @@ fn generate_file(
         substitute(node, library);
     }
 
-    // TODO: how to serialize back to html???
-    println!("{}", dom.to_json_pretty().unwrap());
+    let generated_html = dom.to_html();
+
+    println!("{}", generated_html);
+
+    fs::write(dst_path, generated_html)?;
 
     Ok(())
 }
@@ -175,16 +276,7 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    println!("source = {}", args.source.display());
-    println!("elements = {}", args.elements.display());
-    println!("destination = {}", args.destination.display());
-
     let library = ElementLibrary::from_folder(&args.elements).expect("Failed to load elements");
-
-    println!("Elements:");
-    for element in library.elements().values() {
-        println!("    {}", element.tag_name());
-    }
 
     generate_folder(&args.source, &args.destination, &library).expect("Failed to generate");
 }

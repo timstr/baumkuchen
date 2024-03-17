@@ -173,8 +173,7 @@ dependencies = [
 [[package]]
 name = "html_parser"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6f56db07b6612644f6f7719f8ef944f75fff9d6378fdf3d316fd32194184abd"
+source = "git+https://github.com/timstr/html-parser#9c2eec450d217717dbd0d0572001e78ddb07a8e1"
 dependencies = [
  "doc-comment",
  "pest",
