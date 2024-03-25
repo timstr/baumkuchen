@@ -10,6 +10,8 @@ fn substitute_tag(
     tag_name: xot::NameId,
     replacement: xot::Node,
 ) -> Result<(), xot::Error> {
+    debug_assert!(!xot.is_removed(node));
+    debug_assert!(!xot.is_removed(replacement));
     let xot::Value::Element(elem) = xot.value(node) else {
         return Ok(());
     };
@@ -32,6 +34,7 @@ fn substitute_invocation(
     node: xot::Node,
     invocation: xot::Node,
 ) -> Result<(), xot::Error> {
+    debug_assert!(!xot.is_removed(node));
     // comments and text get passed through unmodified
     let elem_name: String = if let xot::Value::Element(elem) = xot.value(node) {
         xot.name_ns_str(elem.name()).0.to_string()
@@ -73,7 +76,8 @@ fn substitute_invocation(
             xot.insert_before(node, ch)?;
             substitute_tag(xot, ch, loop_var, inv_child)?;
         }
-        xot.remove(node)?;
+        // xot.remove(node)?;
+        xot.detach(node)?;
         return Ok(());
     }
 
@@ -90,7 +94,8 @@ fn substitute_invocation(
             let r = xot.clone(ch);
             xot.insert_before(node, r)?;
         }
-        xot.remove(node)?;
+        // xot.remove(node)?;
+        xot.detach(node)?;
         return Ok(());
     }
 
@@ -108,7 +113,8 @@ fn substitute_invocation(
             let r = xot.new_text(&attr_val);
             xot.insert_before(node, r)?;
         }
-        xot.remove(node)?;
+        // xot.remove(node)?;
+        xot.detach(node)?;
     }
 
     Ok(())
@@ -223,7 +229,8 @@ fn substitute(
         for inst_node in instantiation {
             xot.insert_before(node, inst_node)?;
         }
-        xot.remove(node)?;
+        // xot.remove(node)?;
+        xot.detach(node)?;
         did_anything = true;
     }
 
@@ -270,7 +277,7 @@ fn generate_file(
     fs::write(dst_path, generated_html)?;
 
     // remove document node to free memory (hopefully?)
-    xot.remove(document).expect("Failed to remove document");
+    // xot.remove(document).expect("Failed to remove document");
 
     Ok(())
 }
