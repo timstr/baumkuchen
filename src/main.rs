@@ -1,172 +1,176 @@
 use clap::Parser;
-use kuchikiki::{traits::*, NodeRef};
-use std::{cell::RefCell, collections::HashMap, fs, io, path};
+use std::{collections::HashMap, fs, io, path};
+use xot::Xot;
 
 // Look for and replace single instances of a named tag with
 // the given replacement
-fn substitute_tag(node: kuchikiki::NodeRef, tag_name: &str, replacement: &kuchikiki::NodeRef) {
-    let kuchikiki::NodeData::Element(elem) = node.data() else {
-        return;
+fn substitute_tag(
+    xot: &mut Xot,
+    node: xot::Node,
+    tag_name: xot::NameId,
+    replacement: xot::Node,
+) -> Result<(), xot::Error> {
+    let xot::Value::Element(elem) = xot.value(node) else {
+        return Ok(());
     };
-    if &*elem.name.local == tag_name {
-        node.insert_before(replacement.deep_clone());
-        node.detach();
-        return;
+    if elem.name() == tag_name {
+        let r = xot.clone(replacement);
+        xot.replace(node, r)?;
+        return Ok(());
     }
-    for child in node.children() {
-        substitute_tag(child, tag_name, replacement);
+    let children: Vec<xot::Node> = xot.children(node).collect();
+    for child in children {
+        substitute_tag(xot, child, tag_name, replacement)?;
     }
+    Ok(())
 }
 
 // Process a node, recursively substituting and applying rules, and inserting
 // any resulting nodes in its place
-fn substitute_invocation(node: kuchikiki::NodeRef, invocation: kuchikiki::NodeRef) {
+fn substitute_invocation(
+    xot: &mut Xot,
+    node: xot::Node,
+    invocation: xot::Node,
+) -> Result<(), xot::Error> {
     // comments and text get passed through unmodified
-    let elem_name: String = if let Some(elem) = node.as_element() {
-        elem.name.local.to_string()
+    let elem_name: String = if let xot::Value::Element(elem) = xot.value(node) {
+        xot.name_ns_str(elem.name()).0.to_string()
     } else {
-        return;
+        return Ok(());
     };
 
     // substitute innermost elements
-    for child in node.children() {
-        substitute_invocation(child, invocation.clone());
+    {
+        let children: Vec<xot::Node> = xot.children(node).collect();
+        for child in children {
+            substitute_invocation(xot, child, invocation)?;
+        }
     }
 
     // substitute foreach tags
     if elem_name == "foreachchild" {
-        let attributes = node.as_element().unwrap().attributes.borrow();
-        assert!(attributes.map.len() == 1);
-        let (loop_var, val) = attributes.map.iter().next().unwrap().clone();
+        let attributes = xot.attributes(node);
+        assert!(attributes.len() == 1);
+        let (loop_var, val) = attributes.iter().next().unwrap().clone();
 
-        assert!(val.value.is_empty());
+        assert!(val.is_empty());
 
-        debug_assert!(node.children().filter(|c| c.as_element().is_some()).count() == 1);
+        debug_assert!(xot.children(node).filter(|c| xot.is_element(*c)).count() == 1);
 
-        let node_child = node
-            .children()
-            .filter(|c| c.as_element().is_some())
+        let node_child = xot
+            .children(node)
+            .filter(|c| xot.is_element(*c))
             .next()
             .unwrap();
 
-        for inv_child in invocation.children() {
-            if inv_child.as_element().is_none() {
+        let children: Vec<xot::Node> = xot.children(invocation).collect();
+        for inv_child in children {
+            // don't replace outer white space, text, or comments
+            if !xot.is_element(inv_child) {
                 continue;
             }
-            let ch = node_child.deep_clone();
-            node.insert_before(ch.clone());
-            substitute_tag(ch, &loop_var.local, &inv_child);
+            let ch = xot.clone(node_child);
+            xot.insert_before(node, ch)?;
+            substitute_tag(xot, ch, loop_var, inv_child)?;
         }
-        node.detach();
-        return;
+        xot.remove(node)?;
+        return Ok(());
     }
 
     // Look for tags of the form <self.xyz>
     let Some(attr_name) = elem_name.strip_prefix("self.") else {
         // Pass the node through unmodified otherwise
-        return;
+        return Ok(());
     };
 
     if attr_name == "inner" {
         // replace tags <self.inner> with the node's children
-        for ch in invocation.children() {
-            node.insert_before(ch.deep_clone());
+        let children: Vec<xot::Node> = xot.children(invocation).collect();
+        for ch in children {
+            let r = xot.clone(ch);
+            xot.insert_before(node, r)?;
         }
-        node.detach();
-        return;
-    } else if let Some(attr_val) = invocation
-        .as_element()
-        .unwrap()
-        .attributes
-        .borrow()
-        .get(attr_name)
-    {
-        // replace tags <self.xyz> with attribute value xyz if defined
-        if !attr_val.is_empty() {
-            node.insert_before(NodeRef::new(kuchikiki::NodeData::Text(RefCell::new(
-                attr_val.to_string(),
-            ))));
-        }
-        node.detach();
-    } else {
+        xot.remove(node)?;
+        return Ok(());
+    }
+
+    let Some(attr_id) = xot.name(attr_name) else {
         println!(
             "Warning: undefined attribute self.{} on node <{}>",
             attr_name, elem_name
         );
-        println!("Valid attributes are:");
-        for attr in invocation
-            .as_element()
-            .unwrap()
-            .attributes
-            .borrow()
-            .map
-            .iter()
-        {
-            println!("    {:?}", attr);
+        return Ok(());
+    };
+
+    if let Some(attr_val) = xot.attributes(invocation).get(attr_id).cloned() {
+        // replace tags <self.xyz> with attribute value xyz if defined
+        if !attr_val.is_empty() {
+            let r = xot.new_text(&attr_val);
+            xot.insert_before(node, r)?;
         }
+        xot.remove(node)?;
     }
+
+    Ok(())
 }
 
 struct ElementDefinition {
-    tag_name: String,
-    node: kuchikiki::NodeRef,
+    tag_name: xot::NameId,
+    node: xot::Node,
 }
 
 impl ElementDefinition {
-    fn from_file(path: &std::path::Path) -> Result<ElementDefinition, io::Error> {
+    fn from_file(xot: &mut Xot, path: &std::path::Path) -> Result<ElementDefinition, io::Error> {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
-        let source_text = fs::read_to_string(path)?;
+        let mut source_text = fs::read_to_string(path)?;
 
-        let document = kuchikiki::parse_fragment(
-            kuchikiki::QualName {
-                prefix: None,
-                ns: kuchikiki::Namespace::from("html"),
-                local: kuchikiki::LocalName::from(""),
-            },
-            Default::default(),
-        )
-        .one(source_text);
+        // https://github.com/faassen/xot/issues/22
+        source_text.insert_str(0, "<throwaway>");
+        source_text.push_str("</throwaway>");
 
-        // outer document
-        let document = document.children().next().unwrap();
-        // outer html element
-        let document = document.children().next().unwrap();
+        let document = xot
+            .parse(&source_text)
+            .expect("Failed to parse element definition");
 
         Ok(ElementDefinition {
-            tag_name: name,
+            tag_name: xot.add_name(&name),
             node: document,
         })
     }
 
-    fn tag_name(&self) -> &str {
-        &self.tag_name
+    fn tag_name(&self) -> xot::NameId {
+        self.tag_name
     }
 
-    fn instantiate(&self, invocation: kuchikiki::NodeRef) -> kuchikiki::NodeRef {
-        let node = self.node.deep_clone();
+    fn instantiate(&self, xot: &mut Xot, invocation: xot::Node) -> Result<xot::Node, xot::Error> {
+        // unwrap <throwaway> node
+        let node = xot.children(self.node).next().unwrap();
 
-        for child in node.children() {
-            substitute_invocation(child, invocation.clone());
+        let node = xot.clone(node);
+
+        let children: Vec<xot::Node> = xot.children(node).collect();
+        for child in children {
+            substitute_invocation(xot, child, invocation)?;
         }
 
-        node
+        Ok(node)
     }
 }
 
 struct ElementLibrary {
-    elements: HashMap<String, ElementDefinition>,
+    elements: HashMap<xot::NameId, ElementDefinition>,
 }
 
 impl ElementLibrary {
-    fn from_folder(path: &std::path::Path) -> Result<ElementLibrary, io::Error> {
+    fn from_folder(xot: &mut Xot, path: &std::path::Path) -> Result<ElementLibrary, io::Error> {
         let mut elements = HashMap::new();
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let entry_path = entry.path();
             if let Some(ext) = entry_path.extension() {
                 if ext == "html" {
-                    let element_defn = ElementDefinition::from_file(&entry_path)?;
-                    let prev = elements.insert(element_defn.tag_name().to_string(), element_defn);
+                    let element_defn = ElementDefinition::from_file(xot, &entry_path)?;
+                    let prev = elements.insert(element_defn.tag_name(), element_defn);
                     assert!(prev.is_none());
                 }
             }
@@ -174,57 +178,56 @@ impl ElementLibrary {
         Ok(ElementLibrary { elements })
     }
 
-    fn elements(&self) -> &HashMap<String, ElementDefinition> {
+    fn elements(&self) -> &HashMap<xot::NameId, ElementDefinition> {
         &self.elements
     }
 }
 
-fn substitute(node: kuchikiki::NodeRef, library: &ElementLibrary) -> bool {
-    let Some(element) = node.as_element() else {
-        return false;
+fn substitute(
+    xot: &mut Xot,
+    node: xot::Node,
+    library: &ElementLibrary,
+) -> Result<bool, xot::Error> {
+    let Some(element) = xot.element(node) else {
+        return Ok(false);
     };
-    let element_name = element.name.local.to_string();
+    let element_name = element.name();
 
-    let mut any_substitutions = false;
+    let mut did_anything = false;
 
     // TODO: does this need to be done both before and after?
     loop {
-        let mut did_anything = false;
-        for child in node.children() {
-            if substitute(child, library) {
+        let mut did_anything_inner = false;
+        let children: Vec<xot::Node> = xot.children(node).collect();
+        for child in children {
+            if substitute(xot, child, library)? {
+                did_anything_inner = true;
                 did_anything = true;
+                break;
             }
         }
-        if !did_anything {
+        if !did_anything_inner {
             break;
         }
     }
 
     if let Some(element_defn) = library.elements().get(&element_name) {
-        let instatiation = element_defn.instantiate(node.clone());
-        node.insert_before(instatiation);
-        node.detach();
-
-        any_substitutions = true;
+        let instantiation = element_defn
+            .instantiate(xot, node)
+            .expect("Failed to instantiate node");
+        xot.detach(instantiation)
+            .expect("failed to detach instantiation");
+        xot.replace(node, instantiation).expect("uhhhh");
+        did_anything = true;
     }
 
     // TODO: see above
-    loop {
-        let mut did_anything = false;
-        for child in node.children() {
-            if substitute(child, library) {
-                did_anything = true;
-            }
-        }
-        if !did_anything {
-            break;
-        }
-    }
 
-    any_substitutions
+    Ok(did_anything)
 }
 
 fn generate_file(
+    xot: &mut Xot,
     source_path: &path::Path,
     dst_path: &path::Path,
     library: &ElementLibrary,
@@ -238,24 +241,47 @@ fn generate_file(
     // }
 
     let source_text = fs::read_to_string(source_path)?;
-    let document = kuchikiki::parse_html().one(source_text);
+    let document = xot.parse(&source_text).expect("Failed to parse html file");
 
-    for node in document.children() {
-        substitute(node, library);
+    let children: Vec<xot::Node> = xot.children(document).collect();
+
+    for node in children {
+        substitute(xot, node, library).expect("Failed to substitute document");
     }
 
-    let mut generated_html = Vec::<u8>::new();
-    document.serialize(&mut generated_html)?;
-    let generated_html = String::from_utf8(generated_html).expect("Generated html is not UTF-8");
-
-    // println!("{}", generated_html);
+    let generated_html = xot.to_string(document).expect("Failed to serialize html");
 
     fs::write(dst_path, generated_html)?;
+
+    // remove document node to free memory (hopefully?)
+    xot.remove(document).expect("Failed to remove document");
+
+    Ok(())
+}
+
+fn clean_folder(path: &std::path::Path) -> Result<(), io::Error> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_name().to_str().unwrap().starts_with(".") {
+            continue;
+        }
+        let entry_type = entry.file_type()?;
+        if entry_type.is_file() {
+            fs::remove_file(entry.path())?;
+        } else if entry_type.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
 
     Ok(())
 }
 
 fn generate_folder(
+    xot: &mut Xot,
     source_path: &std::path::Path,
     dst_path: &std::path::Path,
     library: &ElementLibrary,
@@ -276,22 +302,18 @@ fn generate_folder(
         let entry = entry?;
         let entry_path = entry.path();
         let entry_type = entry.file_type()?;
+        let entry_name = entry_path.file_name().unwrap();
         if entry_type.is_dir() {
-            generate_folder(
-                &entry_path,
-                &dst_path.join(entry_path.file_name().unwrap()),
-                library,
-            )?;
+            generate_folder(xot, &entry_path, &dst_path.join(entry_name), library)?;
         } else if entry_type.is_file() {
             if let Some(ext) = entry_path.extension() {
                 if ext == "html" {
-                    generate_file(
-                        &entry_path,
-                        &dst_path.join(entry_path.file_name().unwrap()),
-                        library,
-                    )?;
+                    generate_file(xot, &entry_path, &dst_path.join(entry_name), library)?;
+                    continue;
                 }
             }
+
+            fs::copy(&entry_path, dst_path.join(entry_name))?;
         }
     }
     Ok(())
@@ -308,7 +330,13 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let library = ElementLibrary::from_folder(&args.elements).expect("Failed to load elements");
+    let mut xot = Xot::new();
 
-    generate_folder(&args.source, &args.destination, &library).expect("Failed to generate");
+    let library =
+        ElementLibrary::from_folder(&mut xot, &args.elements).expect("Failed to load elements");
+
+    clean_folder(&args.destination).expect("Failed to clean output directory");
+
+    generate_folder(&mut xot, &args.source, &args.destination, &library)
+        .expect("Failed to generate");
 }
