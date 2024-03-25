@@ -142,19 +142,23 @@ impl ElementDefinition {
         self.tag_name
     }
 
-    fn instantiate(&self, xot: &mut Xot, invocation: xot::Node) -> Result<xot::Node, xot::Error> {
+    fn instantiate(
+        &self,
+        xot: &mut Xot,
+        invocation: xot::Node,
+    ) -> Result<Vec<xot::Node>, xot::Error> {
         // unwrap <throwaway> node
         let node = xot.children(self.node).next().unwrap();
-        let node = xot.children(node).next().unwrap();
+        // let node = xot.children(node).next().unwrap();
 
         let node = xot.clone(node);
 
         let children: Vec<xot::Node> = xot.children(node).collect();
-        for child in children {
-            substitute_invocation(xot, child, invocation)?;
+        for child in &children {
+            substitute_invocation(xot, *child, invocation)?;
         }
 
-        Ok(node)
+        Ok(children)
     }
 }
 
@@ -216,9 +220,10 @@ fn substitute(
         let instantiation = element_defn
             .instantiate(xot, node)
             .expect("Failed to instantiate node");
-        xot.detach(instantiation)
-            .expect("failed to detach instantiation");
-        xot.replace(node, instantiation).expect("uhhhh");
+        for inst_node in instantiation {
+            xot.insert_before(node, inst_node)?;
+        }
+        xot.remove(node)?;
         did_anything = true;
     }
 
@@ -250,7 +255,17 @@ fn generate_file(
         substitute(xot, node, library).expect("Failed to substitute document");
     }
 
-    let generated_html = xot.to_string(document).expect("Failed to serialize html");
+    // let mut generated_html = xot.to_string(document).expect("Failed to serialize html");
+    let generated_html = xot
+        .html5()
+        .serialize_string(
+            xot::output::html5::Parameters {
+                indentation: None,
+                cdata_section_elements: vec![],
+            },
+            document,
+        )
+        .expect("Failed to serialize html");
 
     fs::write(dst_path, generated_html)?;
 
