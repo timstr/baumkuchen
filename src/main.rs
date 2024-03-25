@@ -145,6 +145,7 @@ impl ElementDefinition {
     fn instantiate(&self, xot: &mut Xot, invocation: xot::Node) -> Result<xot::Node, xot::Error> {
         // unwrap <throwaway> node
         let node = xot.children(self.node).next().unwrap();
+        let node = xot.children(node).next().unwrap();
 
         let node = xot.clone(node);
 
