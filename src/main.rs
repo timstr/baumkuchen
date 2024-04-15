@@ -46,19 +46,26 @@ fn substitute_invocation(
     {
         let children: Vec<xot::Node> = xot.children(node).collect();
         for child in children {
+            if xot.is_removed(child) {
+                // Skip any nodes that have already been removed
+                // ??????????????????
+                continue;
+            }
             substitute_invocation(xot, child, invocation)?;
         }
     }
 
     // substitute foreach tags
-    if elem_name == "foreachchild" {
-        let attributes = xot.attributes(node);
-        assert!(attributes.len() == 1);
-        let (loop_var, val) = attributes.iter().next().unwrap().clone();
-
-        assert!(val.is_empty());
-
+    if let Some(loop_var_str) = elem_name.strip_prefix("foreachchild.") {
         debug_assert!(xot.children(node).filter(|c| xot.is_element(*c)).count() == 1);
+
+        let Some(loop_var) = xot.name(&loop_var_str) else {
+            println!(
+                "Warning: found tag \"<foreachchild.{}>\" but there is nothing named \"{}\"",
+                loop_var_str, loop_var_str
+            );
+            return Ok(());
+        };
 
         let node_child = xot
             .children(node)
@@ -94,8 +101,8 @@ fn substitute_invocation(
             let r = xot.clone(ch);
             xot.insert_before(node, r)?;
         }
-        // xot.remove(node)?;
-        xot.detach(node)?;
+        xot.remove(node)?;
+
         return Ok(());
     }
 
@@ -134,9 +141,13 @@ impl ElementDefinition {
         source_text.insert_str(0, "<throwaway>");
         source_text.push_str("</throwaway>");
 
-        let document = xot
-            .parse(&source_text)
-            .expect("Failed to parse element definition");
+        let document = xot.parse(&source_text).unwrap_or_else(|err| {
+            panic!(
+                "Failed to parse element definition at {}: {}",
+                path.display(),
+                err
+            )
+        });
 
         Ok(ElementDefinition {
             tag_name: xot.add_name(&name),
@@ -161,6 +172,7 @@ impl ElementDefinition {
 
         let children: Vec<xot::Node> = xot.children(node).collect();
         for child in &children {
+            debug_assert!(!xot.is_removed(*child));
             substitute_invocation(xot, *child, invocation)?;
         }
 
@@ -227,6 +239,8 @@ fn substitute(
             .instantiate(xot, node)
             .expect("Failed to instantiate node");
         for inst_node in instantiation {
+            debug_assert!(!xot.is_removed(node));
+            debug_assert!(!xot.is_removed(inst_node));
             xot.insert_before(node, inst_node)?;
         }
         // xot.remove(node)?;
@@ -254,7 +268,13 @@ fn generate_file(
     // }
 
     let source_text = fs::read_to_string(source_path)?;
-    let document = xot.parse(&source_text).expect("Failed to parse html file");
+    let document = xot.parse(&source_text).unwrap_or_else(|err| {
+        panic!(
+            "Failed to parse html file at {}: {}",
+            source_path.display(),
+            err
+        )
+    });
 
     let children: Vec<xot::Node> = xot.children(document).collect();
 
