@@ -8,11 +8,34 @@ fn minify(xot: &mut Xot, node: xot::Node) -> Result<(), xot::Error> {
         return xot.remove(node);
     }
 
-    if let Some(text) = xot.text_mut(node) {
-        let trimmed = text.get().trim();
-        if trimmed != text.get() {
-            let trimmed = trimmed.to_string();
-            text.set(trimmed);
+    if let Some(text) = xot.text(node) {
+        let orig_text = text.get();
+        let mut trimmed = orig_text.to_string();
+
+        // Remove leading whitespace. Keep a single space if there was any
+        // space to begin with and there is a previous node.
+        {
+            let trimmed_front = trimmed.trim_start();
+            if xot.previous_sibling(node).is_some() && trimmed_front != trimmed {
+                trimmed = " ".to_string() + trimmed_front;
+            } else {
+                trimmed = trimmed_front.to_string();
+            }
+        }
+
+        // Removing trailing whitespace. Keep a single space if there was any
+        // space to begin with an there is a next node.
+        {
+            let trimmed_end = trimmed.trim_end();
+            if xot.next_sibling(node).is_some() && trimmed_end != trimmed {
+                trimmed = trimmed_end.to_string() + " ";
+            } else {
+                trimmed = trimmed_end.to_string();
+            }
+        }
+
+        if trimmed != orig_text {
+            xot.text_mut(node).unwrap().set(trimmed);
         }
     }
 
