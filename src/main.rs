@@ -7,22 +7,18 @@ fn minify(xot: &mut Xot, node: xot::Node) -> Result<(), xot::Error> {
     if xot.is_comment(node) {
         return xot.remove(node);
     }
+
     if let Some(text) = xot.text_mut(node) {
         let trimmed = text.get().trim();
         if trimmed != text.get() {
-            // TODO: why does this still result in outer whitespace???
             let trimmed = trimmed.to_string();
             text.set(trimmed);
         }
-        return Ok(());
     }
 
     let children: Vec<xot::Node> = xot.children(node).collect();
-    for child in children {
-        if xot.is_removed(child) {
-            continue;
-        }
-        minify(xot, child)?;
+    for child in &children {
+        minify(xot, *child)?;
     }
 
     Ok(())
@@ -72,11 +68,6 @@ fn substitute_invocation(
     {
         let children: Vec<xot::Node> = xot.children(node).collect();
         for child in children {
-            if xot.is_removed(child) {
-                // Skip any nodes that have already been removed
-                // ??????????????????
-                continue;
-            }
             substitute_invocation(xot, child, invocation)?;
         }
     }
@@ -163,7 +154,9 @@ impl ElementDefinition {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let mut source_text = fs::read_to_string(path)?;
 
-        // https://github.com/faassen/xot/issues/22
+        // Wrap the document root in a throwaway node because document roots
+        // currently cannot be moved.
+        // See https://github.com/faassen/xot/issues/22
         source_text.insert_str(0, "<throwaway>");
         source_text.push_str("</throwaway>");
 
@@ -192,7 +185,6 @@ impl ElementDefinition {
     ) -> Result<Vec<xot::Node>, xot::Error> {
         // unwrap <throwaway> node
         let node = xot.children(self.node).next().unwrap();
-        // let node = xot.children(node).next().unwrap();
 
         let node = xot.clone(node);
 
@@ -310,7 +302,6 @@ fn generate_file(
 
     minify(xot, document).expect("Failed to minify document");
 
-    // let mut generated_html = xot.to_string(document).expect("Failed to serialize html");
     let generated_html = xot
         .html5()
         .serialize_string(
@@ -325,7 +316,7 @@ fn generate_file(
     fs::write(dst_path, generated_html)?;
 
     // remove document node to free memory (hopefully?)
-    // xot.remove(document).expect("Failed to remove document");
+    xot.remove(document).expect("Failed to remove document");
 
     Ok(())
 }
@@ -402,6 +393,11 @@ fn main() {
     let args = Args::parse();
 
     let mut xot = Xot::new();
+
+    // Disable text consolidation (merging of text nodes while modifying)
+    // because it wreacks havoc when modifying nodes while iterating.
+    // See https://github.com/faassen/xot/issues/25
+    xot.set_text_consolidation(false);
 
     let library =
         ElementLibrary::from_folder(&mut xot, &args.elements).expect("Failed to load elements");
