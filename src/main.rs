@@ -2,6 +2,32 @@ use clap::Parser;
 use std::{collections::HashMap, fs, io, path};
 use xot::Xot;
 
+// Remove comments and outer whitespace from an existing node
+fn minify(xot: &mut Xot, node: xot::Node) -> Result<(), xot::Error> {
+    if xot.is_comment(node) {
+        return xot.remove(node);
+    }
+    if let Some(text) = xot.text_mut(node) {
+        let trimmed = text.get().trim();
+        if trimmed != text.get() {
+            // TODO: why does this still result in outer whitespace???
+            let trimmed = trimmed.to_string();
+            text.set(trimmed);
+        }
+        return Ok(());
+    }
+
+    let children: Vec<xot::Node> = xot.children(node).collect();
+    for child in children {
+        if xot.is_removed(child) {
+            continue;
+        }
+        minify(xot, child)?;
+    }
+
+    Ok(())
+}
+
 // Look for and replace single instances of a named tag with
 // the given replacement
 fn substitute_tag(
@@ -281,6 +307,8 @@ fn generate_file(
     for node in children {
         substitute(xot, node, library).expect("Failed to substitute document");
     }
+
+    minify(xot, document).expect("Failed to minify document");
 
     // let mut generated_html = xot.to_string(document).expect("Failed to serialize html");
     let generated_html = xot
