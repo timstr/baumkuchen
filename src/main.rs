@@ -1,5 +1,5 @@
 use clap::Parser;
-use regex::Regex;
+use regex::{Captures, Regex};
 use std::{collections::HashMap, fs, io, path};
 use xot::Xot;
 
@@ -126,21 +126,72 @@ fn substitute_foreach(
     return Ok(());
 }
 
-fn evaluate_expression(expr: &str, context: &Context) -> String {
-    match expr {
-        "self.filepath" => context.file_path.to_string(),
-        _ => panic!("Unrecognized expression: \"{}\"", expr),
+fn evaluate_expression(xot: &Xot, expr: &str, invocation: xot::Node, context: &Context) -> String {
+    // 'self.filepath' evaluates to context's filepath
+    if expr == "self.filepath" {
+        return context.file_path.to_string();
     }
+    // 'self.xyz' evaluates to contents of 'xyz' attribute of invocation element
+    if let Some(attr_name) = expr.strip_prefix("self.") {
+        let Some(attr_value) = xot
+            .name(attr_name)
+            .map(|id| xot.attributes(invocation).get(id))
+            .flatten()
+        else {
+            println!("Warning: reference to missing attribute \"{}\"", attr_name);
+            return "".to_string();
+        };
+
+        debug_assert!(!attr_value.contains('$'));
+        return attr_value.to_string();
+    }
+    println!("Warning: unrecognized expression: \"{}\"", expr);
+    "".to_string()
 }
 
-fn expression_matches_pattern(expr_value: &str, pattern: &str) -> bool {
+fn expand_string(xot: &Xot, expr_string: &str, invocation: xot::Node, context: &Context) -> String {
+    // TODO: don't recompile each time
+    let expr_regex = Regex::new(r"\$\{([a-zA-Z0-9_\-\.]+)}").unwrap();
+
+    expr_regex
+        .replace_all(expr_string, |captures: &Captures| -> String {
+            let s = evaluate_expression(xot, &captures[1], invocation, context);
+            // println!("Expanding \"{}\" into \"{}\"", &captures[0], s);
+            s
+        })
+        .to_string()
+}
+
+fn expression_matches_pattern(
+    xot: &Xot,
+    expr_string: &str,
+    pattern_string: &str,
+    invocation: xot::Node,
+    context: &Context,
+) -> bool {
+    // println!(
+    //     "Testing whether expression \"{}\" == \"{}\"",
+    //     expr_string, pattern_string
+    // );
+
+    // Expand any expressions
+    let expr_value = evaluate_expression(xot, expr_string, invocation, context);
+    let pattern_value = expand_string(xot, pattern_string, invocation, context);
+
+    // println!(" -> \"{}\" == \"{}\"", expr_value, pattern_value);
+
     // Wrap pattern in '^' and '$' to force matching the entire string
-    let pattern = format!("^{}$", pattern);
+    let pattern = format!("^{}$", pattern_value);
     let re = Regex::new(&pattern).expect("Invalid regex");
-    re.is_match(expr_value)
+    re.is_match(&expr_value)
 }
 
-fn substitute_if(xot: &mut Xot, node: xot::Node, context: &Context) -> Result<(), xot::Error> {
+fn substitute_if(
+    xot: &mut Xot,
+    node: xot::Node,
+    invocation: xot::Node,
+    context: &Context,
+) -> Result<(), xot::Error> {
     // expect a single attribute of the form `expression="value-pattern"` and evaluate it
     let condition = {
         let attrs = xot.attributes(node);
@@ -148,8 +199,7 @@ fn substitute_if(xot: &mut Xot, node: xot::Node, context: &Context) -> Result<()
         let (attr_name_id, pattern) = attrs_iter.next().expect("msg");
         assert!(attrs_iter.next().is_none());
         let expr = xot.name_ns_str(attr_name_id).0;
-        let expr_value = evaluate_expression(expr, context);
-        expression_matches_pattern(&expr_value, pattern)
+        expression_matches_pattern(xot, expr, pattern, invocation, context)
     };
 
     // look for a 'then' child node
@@ -177,6 +227,10 @@ fn substitute_if(xot: &mut Xot, node: xot::Node, context: &Context) -> Result<()
             None
         })
         .flatten();
+
+    if node_then.is_none() && node_else.is_none() {
+        println!("Warning: <if> element without a nested <then> or <else> element");
+    }
 
     if condition {
         // if match, replace with contents of 'then'
@@ -245,6 +299,34 @@ fn substitute_attr(
     Ok(())
 }
 
+// Recursively visit all string attributes of all descendants of a node
+// and expand expressions
+fn expand_all_attr_strings(
+    xot: &mut Xot,
+    node: xot::Node,
+    invocation: xot::Node,
+    context: &Context,
+) -> Result<(), xot::Error> {
+    // Visit all attributes
+    {
+        let keys: Vec<xot::NameId> = xot.attributes(node).keys().collect();
+        for key in keys {
+            let Some(value) = xot.attributes(node).get(key) else {
+                continue;
+            };
+            let new_value = expand_string(xot, &value, invocation, context);
+            *xot.attributes_mut(node).get_mut(key).unwrap() = new_value;
+        }
+    }
+
+    let children: Vec<xot::Node> = xot.children(node).collect();
+    for child in children {
+        expand_all_attr_strings(xot, child, invocation, context)?;
+    }
+
+    Ok(())
+}
+
 // Process a node, recursively substituting and applying rules, and inserting
 // any resulting nodes in its place
 fn substitute_invocation(
@@ -276,7 +358,7 @@ fn substitute_invocation(
 
     // substitute <if> tags
     if elem_name == "if" {
-        return substitute_if(xot, node, context);
+        return substitute_if(xot, node, invocation, context);
     }
 
     // Look for tags of the form <self.xyz>
@@ -333,9 +415,10 @@ impl ElementDefinition {
         let node = xot.clone(node);
 
         let children: Vec<xot::Node> = xot.children(node).collect();
-        for child in &children {
-            debug_assert!(!xot.is_removed(*child));
-            substitute_invocation(xot, *child, invocation, context)?;
+        for child in children {
+            debug_assert!(!xot.is_removed(child));
+            expand_all_attr_strings(xot, child, invocation, context)?;
+            substitute_invocation(xot, child, invocation, context)?;
         }
 
         Ok(xot.children(node).collect())
@@ -440,11 +523,12 @@ fn generate_file(
         )
     });
 
-    let file_path = source_path
-        .strip_prefix(source_root)
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let file_path = "/".to_string()
+        + &source_path
+            .strip_prefix(source_root)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
 
     let context = Context { file_path };
 
