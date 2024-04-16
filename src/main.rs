@@ -1,6 +1,13 @@
 use clap::Parser;
+use regex::Regex;
 use std::{collections::HashMap, fs, io, path};
 use xot::Xot;
+
+struct Context {
+    // path of the document currently being generated, relative
+    // to the root of the source directory
+    file_path: String,
+}
 
 // Remove comments and outer whitespace from an existing node
 fn minify(xot: &mut Xot, node: xot::Node) -> Result<(), xot::Error> {
@@ -10,27 +17,32 @@ fn minify(xot: &mut Xot, node: xot::Node) -> Result<(), xot::Error> {
 
     if let Some(text) = xot.text(node) {
         let orig_text = text.get();
-        let mut trimmed = orig_text.to_string();
 
-        // Remove leading whitespace. Keep a single space if there was any
-        // space to begin with and there is a previous node.
+        // Replace all runs of whitespace with just a single space
+        let mut trimmed = {
+            let mut s = String::new();
+            let mut words = orig_text.split_whitespace();
+            if let Some(w) = words.next() {
+                s = w.to_string();
+            }
+            while let Some(w) = words.next() {
+                s += " ";
+                s += w;
+            }
+            s
+        };
+
+        // Add backing a leading space if it was removed and there is a previous node
         {
-            let trimmed_front = trimmed.trim_start();
-            if xot.previous_sibling(node).is_some() && trimmed_front != trimmed {
-                trimmed = " ".to_string() + trimmed_front;
-            } else {
-                trimmed = trimmed_front.to_string();
+            if xot.previous_sibling(node).is_some() && orig_text.starts_with(char::is_whitespace) {
+                trimmed.insert(0, ' ');
             }
         }
 
-        // Removing trailing whitespace. Keep a single space if there was any
-        // space to begin with an there is a next node.
+        // Add backing a trailing space if it was removed and there is a next node
         {
-            let trimmed_end = trimmed.trim_end();
-            if xot.next_sibling(node).is_some() && trimmed_end != trimmed {
-                trimmed = trimmed_end.to_string() + " ";
-            } else {
-                trimmed = trimmed_end.to_string();
+            if xot.next_sibling(node).is_some() && orig_text.ends_with(char::is_whitespace) {
+                trimmed.push(' ');
             }
         }
 
@@ -72,67 +84,133 @@ fn substitute_tag(
     Ok(())
 }
 
-// Process a node, recursively substituting and applying rules, and inserting
-// any resulting nodes in its place
-fn substitute_invocation(
+fn substitute_foreach(
     xot: &mut Xot,
     node: xot::Node,
     invocation: xot::Node,
 ) -> Result<(), xot::Error> {
-    debug_assert!(!xot.is_removed(node));
-    // comments and text get passed through unmodified
-    let elem_name: String = if let xot::Value::Element(elem) = xot.value(node) {
-        xot.name_ns_str(elem.name()).0.to_string()
-    } else {
+    let loop_var_str = xot
+        .name_ns_str(xot.node_name(node).unwrap())
+        .0
+        .strip_prefix("foreachchild.")
+        .unwrap();
+
+    debug_assert!(xot.children(node).filter(|c| xot.is_element(*c)).count() == 1);
+
+    let Some(loop_var) = xot.name(&loop_var_str) else {
+        println!(
+            "Warning: found tag \"<foreachchild.{}>\" but there is nothing named \"{}\"",
+            loop_var_str, loop_var_str
+        );
         return Ok(());
     };
 
-    // substitute innermost elements
-    {
-        let children: Vec<xot::Node> = xot.children(node).collect();
-        for child in children {
-            substitute_invocation(xot, child, invocation)?;
+    let node_child = xot
+        .children(node)
+        .filter(|c| xot.is_element(*c))
+        .next()
+        .unwrap();
+
+    let children: Vec<xot::Node> = xot.children(invocation).collect();
+    for inv_child in children {
+        // don't replace outer white space, text, or comments
+        if !xot.is_element(inv_child) {
+            continue;
         }
+        let ch = xot.clone(node_child);
+        xot.insert_before(node, ch)?;
+        substitute_tag(xot, ch, loop_var, inv_child)?;
     }
+    // xot.remove(node)?;
+    xot.detach(node)?;
+    return Ok(());
+}
 
-    // substitute foreach tags
-    if let Some(loop_var_str) = elem_name.strip_prefix("foreachchild.") {
-        debug_assert!(xot.children(node).filter(|c| xot.is_element(*c)).count() == 1);
+fn evaluate_expression(expr: &str, context: &Context) -> String {
+    match expr {
+        "self.filepath" => context.file_path.to_string(),
+        _ => panic!("Unrecognized expression: \"{}\"", expr),
+    }
+}
 
-        let Some(loop_var) = xot.name(&loop_var_str) else {
-            println!(
-                "Warning: found tag \"<foreachchild.{}>\" but there is nothing named \"{}\"",
-                loop_var_str, loop_var_str
-            );
-            return Ok(());
-        };
+fn expression_matches_pattern(expr_value: &str, pattern: &str) -> bool {
+    // Wrap pattern in '^' and '$' to force matching the entire string
+    let pattern = format!("^{}$", pattern);
+    let re = Regex::new(&pattern).expect("Invalid regex");
+    re.is_match(expr_value)
+}
 
-        let node_child = xot
-            .children(node)
-            .filter(|c| xot.is_element(*c))
-            .next()
-            .unwrap();
+fn substitute_if(xot: &mut Xot, node: xot::Node, context: &Context) -> Result<(), xot::Error> {
+    // expect a single attribute of the form `expression="value-pattern"` and evaluate it
+    let condition = {
+        let attrs = xot.attributes(node);
+        let mut attrs_iter = attrs.iter();
+        let (attr_name_id, pattern) = attrs_iter.next().expect("msg");
+        assert!(attrs_iter.next().is_none());
+        let expr = xot.name_ns_str(attr_name_id).0;
+        let expr_value = evaluate_expression(expr, context);
+        expression_matches_pattern(&expr_value, pattern)
+    };
 
-        let children: Vec<xot::Node> = xot.children(invocation).collect();
-        for inv_child in children {
-            // don't replace outer white space, text, or comments
-            if !xot.is_element(inv_child) {
-                continue;
+    // look for a 'then' child node
+    let node_then = xot
+        .name("then")
+        .map(|id| {
+            for child in xot.children(node) {
+                if xot.node_name(child) == Some(id) {
+                    return Some(child);
+                }
             }
-            let ch = xot.clone(node_child);
-            xot.insert_before(node, ch)?;
-            substitute_tag(xot, ch, loop_var, inv_child)?;
-        }
-        // xot.remove(node)?;
-        xot.detach(node)?;
-        return Ok(());
-    }
+            None
+        })
+        .flatten();
 
-    // Look for tags of the form <self.xyz>
-    let Some(attr_name) = elem_name.strip_prefix("self.") else {
-        // Pass the node through unmodified otherwise
-        return Ok(());
-    };
+    // look for an 'else' child node
+    let node_else = xot
+        .name("else")
+        .map(|id| {
+            for child in xot.children(node) {
+                if xot.node_name(child) == Some(id) {
+                    return Some(child);
+                }
+            }
+            None
+        })
+        .flatten();
+
+    if condition {
+        // if match, replace with contents of 'then'
+        if let Some(node_then) = node_then {
+            let children: Vec<xot::Node> = xot.children(node_then).collect();
+            for ch in children {
+                let ch = xot.clone(ch);
+                xot.insert_before(node, ch)?;
+            }
+        }
+        xot.remove(node)
+    } else {
+        // otherwise, replace with contents of 'else'
+        if let Some(node_else) = node_else {
+            let children: Vec<xot::Node> = xot.children(node_else).collect();
+            for ch in children {
+                let ch = xot.clone(ch);
+                xot.insert_before(node, ch)?;
+            }
+        }
+        xot.remove(node)
+    }
+}
+
+fn substitute_attr(
+    xot: &mut Xot,
+    node: xot::Node,
+    invocation: xot::Node,
+) -> Result<(), xot::Error> {
+    let attr_name = xot
+        .name_ns_str(xot.node_name(node).unwrap())
+        .0
+        .strip_prefix("self.")
+        .unwrap();
 
     if attr_name == "inner" {
         // replace tags <self.inner> with the node's children
@@ -148,8 +226,8 @@ fn substitute_invocation(
 
     let Some(attr_id) = xot.name(attr_name) else {
         println!(
-            "Warning: undefined attribute self.{} on node <{}>",
-            attr_name, elem_name
+            "Warning: undefined attribute \"{}\" referenced in node <self.{}>",
+            attr_name, attr_name
         );
         return Ok(());
     };
@@ -162,6 +240,48 @@ fn substitute_invocation(
         }
         // xot.remove(node)?;
         xot.detach(node)?;
+    }
+
+    Ok(())
+}
+
+// Process a node, recursively substituting and applying rules, and inserting
+// any resulting nodes in its place
+fn substitute_invocation(
+    xot: &mut Xot,
+    node: xot::Node,
+    invocation: xot::Node,
+    context: &Context,
+) -> Result<(), xot::Error> {
+    debug_assert!(!xot.is_removed(node));
+    // comments and text get passed through unmodified
+    let elem_name: String = if let xot::Value::Element(elem) = xot.value(node) {
+        xot.name_ns_str(elem.name()).0.to_string()
+    } else {
+        return Ok(());
+    };
+
+    // substitute innermost elements
+    {
+        let children: Vec<xot::Node> = xot.children(node).collect();
+        for child in children {
+            substitute_invocation(xot, child, invocation, context)?;
+        }
+    }
+
+    // substitute <foreachchild.*> tags
+    if elem_name.starts_with("foreachchild.") {
+        return substitute_foreach(xot, node, invocation);
+    }
+
+    // substitute <if> tags
+    if elem_name == "if" {
+        return substitute_if(xot, node, context);
+    }
+
+    // Look for tags of the form <self.xyz>
+    if elem_name.starts_with("self.") {
+        return substitute_attr(xot, node, invocation);
     }
 
     Ok(())
@@ -205,6 +325,7 @@ impl ElementDefinition {
         &self,
         xot: &mut Xot,
         invocation: xot::Node,
+        context: &Context,
     ) -> Result<Vec<xot::Node>, xot::Error> {
         // unwrap <throwaway> node
         let node = xot.children(self.node).next().unwrap();
@@ -214,10 +335,10 @@ impl ElementDefinition {
         let children: Vec<xot::Node> = xot.children(node).collect();
         for child in &children {
             debug_assert!(!xot.is_removed(*child));
-            substitute_invocation(xot, *child, invocation)?;
+            substitute_invocation(xot, *child, invocation, context)?;
         }
 
-        Ok(children)
+        Ok(xot.children(node).collect())
     }
 }
 
@@ -251,6 +372,7 @@ fn substitute(
     xot: &mut Xot,
     node: xot::Node,
     library: &ElementLibrary,
+    context: &Context,
 ) -> Result<bool, xot::Error> {
     let Some(element) = xot.element(node) else {
         return Ok(false);
@@ -264,7 +386,7 @@ fn substitute(
         let mut did_anything_inner = false;
         let children: Vec<xot::Node> = xot.children(node).collect();
         for child in children {
-            if substitute(xot, child, library)? {
+            if substitute(xot, child, library, context)? {
                 did_anything_inner = true;
                 did_anything = true;
                 break;
@@ -277,7 +399,7 @@ fn substitute(
 
     if let Some(element_defn) = library.elements().get(&element_name) {
         let instantiation = element_defn
-            .instantiate(xot, node)
+            .instantiate(xot, node, context)
             .expect("Failed to instantiate node");
         for inst_node in instantiation {
             debug_assert!(!xot.is_removed(node));
@@ -296,6 +418,7 @@ fn substitute(
 
 fn generate_file(
     xot: &mut Xot,
+    source_root: &path::Path,
     source_path: &path::Path,
     dst_path: &path::Path,
     library: &ElementLibrary,
@@ -317,10 +440,17 @@ fn generate_file(
         )
     });
 
-    let children: Vec<xot::Node> = xot.children(document).collect();
+    let file_path = source_path
+        .strip_prefix(source_root)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
 
+    let context = Context { file_path };
+
+    let children: Vec<xot::Node> = xot.children(document).collect();
     for node in children {
-        substitute(xot, node, library).expect("Failed to substitute document");
+        substitute(xot, node, library, &context).expect("Failed to substitute document");
     }
 
     minify(xot, document).expect("Failed to minify document");
@@ -352,6 +482,11 @@ fn clean_folder(path: &std::path::Path) -> Result<(), io::Error> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         if entry.file_name().to_str().unwrap().starts_with(".") {
+            println!(
+                "Not deleting \"{}\" at \"{}\"",
+                entry.file_name().to_str().unwrap(),
+                path.display()
+            );
             continue;
         }
         let entry_type = entry.file_type()?;
@@ -367,6 +502,7 @@ fn clean_folder(path: &std::path::Path) -> Result<(), io::Error> {
 
 fn generate_folder(
     xot: &mut Xot,
+    source_root: &path::Path,
     source_path: &std::path::Path,
     dst_path: &std::path::Path,
     library: &ElementLibrary,
@@ -389,11 +525,23 @@ fn generate_folder(
         let entry_type = entry.file_type()?;
         let entry_name = entry_path.file_name().unwrap();
         if entry_type.is_dir() {
-            generate_folder(xot, &entry_path, &dst_path.join(entry_name), library)?;
+            generate_folder(
+                xot,
+                source_root,
+                &entry_path,
+                &dst_path.join(entry_name),
+                library,
+            )?;
         } else if entry_type.is_file() {
             if let Some(ext) = entry_path.extension() {
                 if ext == "html" {
-                    generate_file(xot, &entry_path, &dst_path.join(entry_name), library)?;
+                    generate_file(
+                        xot,
+                        source_root,
+                        &entry_path,
+                        &dst_path.join(entry_name),
+                        library,
+                    )?;
                     continue;
                 }
             }
@@ -427,6 +575,12 @@ fn main() {
 
     clean_folder(&args.destination).expect("Failed to clean output directory");
 
-    generate_folder(&mut xot, &args.source, &args.destination, &library)
-        .expect("Failed to generate");
+    generate_folder(
+        &mut xot,
+        &args.source,
+        &args.source,
+        &args.destination,
+        &library,
+    )
+    .expect("Failed to generate");
 }
