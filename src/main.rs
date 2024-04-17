@@ -7,6 +7,21 @@ struct Context {
     // path of the document currently being generated, relative
     // to the root of the source directory
     file_path: String,
+    regex_dollar_expansion: Regex,
+    regex_or_expr: Regex,
+}
+
+impl Context {
+    fn new(file_path: String) -> Context {
+        let regex_dollar_expansion = Regex::new(r"\$\{([a-zA-Z0-9_\-\.\|]+)}").unwrap();
+        let regex_or_expr = Regex::new(r"^([a-zA-Z0-9_\-\.]+)\|\|([a-zA-Z0-9_\-\.]+)$").unwrap();
+
+        Context {
+            file_path,
+            regex_dollar_expansion,
+            regex_or_expr,
+        }
+    }
 }
 
 // Remove comments and outer whitespace from an existing node
@@ -150,6 +165,21 @@ fn evaluate_expression(xot: &Xot, expr: &str, invocation: xot::Node, context: &C
     if expr == "self.filepath" {
         return context.file_path.to_string();
     }
+
+    // "A||B" evaluates expression A and returns it if defined and non-empty,
+    // otherwise evaluates and returns expression B
+    // TODO: if more general context-free expressions are needed,
+    // implement a proper parser
+    if let Some(captures) = context.regex_or_expr.captures(expr) {
+        let a = &captures[1];
+        let b = &captures[2];
+        let a_val = evaluate_expression(xot, a, invocation, context);
+        if !a_val.is_empty() {
+            return a_val;
+        }
+        return evaluate_expression(xot, b, invocation, context);
+    }
+
     // 'self.xyz' evaluates to contents of 'xyz' attribute of invocation element
     if let Some(attr_name) = expr.strip_prefix("self.") {
         let Some(attr_value) = xot
@@ -157,22 +187,21 @@ fn evaluate_expression(xot: &Xot, expr: &str, invocation: xot::Node, context: &C
             .map(|id| xot.attributes(invocation).get(id))
             .flatten()
         else {
-            println!("Warning: reference to missing attribute \"{}\"", attr_name);
+            // println!("Warning: reference to missing attribute \"{}\"", attr_name);
             return "".to_string();
         };
 
         debug_assert!(!attr_value.contains('$'));
         return attr_value.to_string();
     }
+
     println!("Warning: unrecognized expression: \"{}\"", expr);
     "".to_string()
 }
 
 fn expand_string(xot: &Xot, expr_string: &str, invocation: xot::Node, context: &Context) -> String {
-    // TODO: don't recompile each time
-    let expr_regex = Regex::new(r"\$\{([a-zA-Z0-9_\-\.]+)}").unwrap();
-
-    expr_regex
+    context
+        .regex_dollar_expansion
         .replace_all(expr_string, |captures: &Captures| -> String {
             let s = evaluate_expression(xot, &captures[1], invocation, context);
             // println!("Expanding \"{}\" into \"{}\"", &captures[0], s);
@@ -542,7 +571,7 @@ fn generate_file(
             .to_string_lossy()
             .to_string();
 
-    let context = Context { file_path };
+    let context = Context::new(file_path);
 
     let children: Vec<xot::Node> = xot.children(document).collect();
     for node in children {
