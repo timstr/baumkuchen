@@ -66,6 +66,8 @@ fn substitute_tag(
     node: xot::Node,
     tag_name: xot::NameId,
     replacement: xot::Node,
+    invocation: xot::Node,
+    context: &Context,
 ) -> Result<(), xot::Error> {
     debug_assert!(!xot.is_removed(node));
     debug_assert!(!xot.is_removed(replacement));
@@ -74,12 +76,26 @@ fn substitute_tag(
     };
     if elem.name() == tag_name {
         let r = xot.clone(replacement);
+        // expand and propagate any attributes
+        let orig_attrs: Vec<(String, String)> = xot
+            .attributes(node)
+            .iter()
+            .map(|(key, value)| {
+                let key = xot.name_ns_str(key).0.to_string();
+                let value = expand_string(xot, value, invocation, context);
+                (key, value)
+            })
+            .collect();
         xot.replace(node, r)?;
+        for (key, value) in orig_attrs {
+            let key_id = xot.add_name(&key);
+            xot.attributes_mut(r).insert(key_id, value);
+        }
         return Ok(());
     }
     let children: Vec<xot::Node> = xot.children(node).collect();
     for child in children {
-        substitute_tag(xot, child, tag_name, replacement)?;
+        substitute_tag(xot, child, tag_name, replacement, invocation, context)?;
     }
     Ok(())
 }
@@ -88,6 +104,7 @@ fn substitute_foreach(
     xot: &mut Xot,
     node: xot::Node,
     invocation: xot::Node,
+    context: &Context,
 ) -> Result<(), xot::Error> {
     let loop_var_str = xot
         .name_ns_str(xot.node_name(node).unwrap())
@@ -118,8 +135,14 @@ fn substitute_foreach(
             continue;
         }
         let ch = xot.clone(node_child);
+
         xot.insert_before(node, ch)?;
-        substitute_tag(xot, ch, loop_var, inv_child)?;
+
+        // expand any attribute expressions
+        // Uhhhhhhhhhhhhhh
+        // expand_all_attr_strings(xot, ch, invocation, context)?;
+
+        substitute_tag(xot, ch, loop_var, inv_child, invocation, context)?;
     }
     // xot.remove(node)?;
     xot.detach(node)?;
@@ -353,7 +376,7 @@ fn substitute_invocation(
 
     // substitute <foreachchild.*> tags
     if elem_name.starts_with("foreachchild.") {
-        return substitute_foreach(xot, node, invocation);
+        return substitute_foreach(xot, node, invocation, context);
     }
 
     // substitute <if> tags
