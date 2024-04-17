@@ -138,10 +138,6 @@ fn substitute_foreach(
 
         xot.insert_before(node, ch)?;
 
-        // expand any attribute expressions
-        // Uhhhhhhhhhhhhhh
-        // expand_all_attr_strings(xot, ch, invocation, context)?;
-
         substitute_tag(xot, ch, loop_var, inv_child, invocation, context)?;
     }
     // xot.remove(node)?;
@@ -437,12 +433,8 @@ impl ElementDefinition {
 
         let node = xot.clone(node);
 
-        let children: Vec<xot::Node> = xot.children(node).collect();
-        for child in children {
-            debug_assert!(!xot.is_removed(child));
-            expand_all_attr_strings(xot, child, invocation, context)?;
-            substitute_invocation(xot, child, invocation, context)?;
-        }
+        expand_all_attr_strings(xot, node, invocation, context)?;
+        substitute_invocation(xot, node, invocation, context)?;
 
         Ok(xot.children(node).collect())
     }
@@ -487,22 +479,6 @@ fn substitute(
 
     let mut did_anything = false;
 
-    // TODO: does this need to be done both before and after?
-    loop {
-        let mut did_anything_inner = false;
-        let children: Vec<xot::Node> = xot.children(node).collect();
-        for child in children {
-            if substitute(xot, child, library, context)? {
-                did_anything_inner = true;
-                did_anything = true;
-                break;
-            }
-        }
-        if !did_anything_inner {
-            break;
-        }
-    }
-
     if let Some(element_defn) = library.elements().get(&element_name) {
         let instantiation = element_defn
             .instantiate(xot, node, context)
@@ -517,7 +493,20 @@ fn substitute(
         did_anything = true;
     }
 
-    // TODO: see above
+    loop {
+        let mut did_anything_inner = false;
+        let children: Vec<xot::Node> = xot.children(node).collect();
+        for child in children {
+            if substitute(xot, child, library, context)? {
+                did_anything_inner = true;
+                did_anything = true;
+                break;
+            }
+        }
+        if !did_anything_inner {
+            break;
+        }
+    }
 
     Ok(did_anything)
 }
