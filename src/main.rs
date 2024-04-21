@@ -61,6 +61,12 @@ fn minify(xot: &mut Xot, node: xot::Node) -> Result<(), xot::Error> {
             }
         }
 
+        // Remove the node outright if it is empty or all white space
+        // NOTE: this implicitly assumes that both adjacent siblings are not inline elements
+        if trimmed.chars().all(char::is_whitespace) {
+            return xot.remove(node);
+        }
+
         if trimmed != orig_text {
             xot.text_mut(node).unwrap().set(trimmed);
         }
