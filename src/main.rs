@@ -683,11 +683,30 @@ fn generate_folder(
     Ok(())
 }
 
+/// Static html site generator with basic procedural html fragment substitution
 #[derive(Parser, Debug)]
 #[command(about)]
 struct Args {
+    /// Path to a directory of files to copy and expand.
+    /// HTML files are parsed and any tags with names
+    /// matching files in the elements directory are expanded
+    /// according to those definitions. Other files are copied
+    /// without modifications.
     source: std::path::PathBuf,
+
+    /// Path to a directory of html element files. These
+    /// resemble HTML fragments but with additional expressions
+    /// that are unique to baumkuchen, such as <if>. The
+    /// name of each html file without the suffix is used
+    /// to expand instances of tags with the same name.
+    /// For example, if the elements directory contains a
+    /// file called widget.html, and a html file in the source
+    /// directory includes a <widget> tag, that tag will be
+    /// replaced with the expanded contents of widget.html
     elements: std::path::PathBuf,
+
+    /// Path to a directory where expanded/copied files from
+    /// the source directory should be written to
     destination: std::path::PathBuf,
 }
 
