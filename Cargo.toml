@@ -1,5 +1,5 @@
 [package]
-name = "html-generator"
+name = "baumkuchen"
 version = "0.1.0"
 edition = "2021"
 
