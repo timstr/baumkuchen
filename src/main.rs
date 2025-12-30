@@ -121,7 +121,7 @@ fn substitute_tag(
     Ok(())
 }
 
-fn substitute_foreach(
+fn substitute_foreachchild(
     xot: &mut Xot,
     node: xot::Node,
     invocation: xot::Node,
@@ -133,7 +133,7 @@ fn substitute_foreach(
         .strip_prefix("foreachchild.")
         .unwrap();
 
-    debug_assert!(xot.children(node).filter(|c| xot.is_element(*c)).count() == 1);
+    assert!(xot.children(node).filter(|c| xot.is_element(*c)).count() == 1);
 
     let Some(loop_var) = xot.name(&loop_var_str) else {
         println!(
@@ -201,8 +201,8 @@ fn evaluate_expression(xot: &Xot, expr: &str, invocation: xot::Node, context: &C
         return attr_value.to_string();
     }
 
-    println!("Warning: unrecognized expression: \"{}\"", expr);
-    "".to_string()
+    // If nothing else matches, leave the expression as-is as a literal
+    expr.to_string()
 }
 
 fn expand_string(xot: &Xot, expr_string: &str, invocation: xot::Node, context: &Context) -> String {
@@ -250,7 +250,9 @@ fn substitute_if(
     let condition = {
         let attrs = xot.attributes(node);
         let mut attrs_iter = attrs.iter();
-        let (attr_name_id, pattern) = attrs_iter.next().expect("msg");
+        let (attr_name_id, pattern) = attrs_iter
+            .next()
+            .expect("<if> tag must contain an attribute");
         assert!(attrs_iter.next().is_none());
         let expr = xot.name_ns_str(attr_name_id).0;
         expression_matches_pattern(xot, expr, pattern, invocation, context)
@@ -407,7 +409,7 @@ fn substitute_invocation(
 
     // substitute <foreachchild.*> tags
     if elem_name.starts_with("foreachchild.") {
-        return substitute_foreach(xot, node, invocation, context);
+        return substitute_foreachchild(xot, node, invocation, context);
     }
 
     // substitute <if> tags
