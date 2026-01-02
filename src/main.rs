@@ -1,18 +1,26 @@
 use clap::Parser;
 use regex::{Captures, Regex};
-use std::{collections::HashMap, fs, io, path};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    fs::{self, read_dir},
+    io, panic,
+    path::{self, PathBuf},
+};
 use xot::Xot;
 
+#[derive(Clone)]
 struct Context {
     // path of the document currently being generated, relative
     // to the root of the source directory
     file_path: String,
     regex_dollar_expansion: Regex,
     regex_or_expr: Regex,
+    source_root: PathBuf,
 }
 
 impl Context {
-    fn new(file_path: String) -> Context {
+    fn new(file_path: String, source_root: PathBuf) -> Context {
         let regex_dollar_expansion = Regex::new(r"\$\{([a-zA-Z0-9_\-\.\|]+)}").unwrap();
         let regex_or_expr = Regex::new(r"^([a-zA-Z0-9_\-\.]+)\|\|([a-zA-Z0-9_\-\.]+)$").unwrap();
 
@@ -20,6 +28,7 @@ impl Context {
             file_path,
             regex_dollar_expansion,
             regex_or_expr,
+            source_root,
         }
     }
 }
@@ -164,6 +173,89 @@ fn substitute_foreachchild(
     // xot.remove(node)?;
     xot.detach(node)?;
     return Ok(());
+}
+
+fn substitute_foreachfile(
+    xot: &mut Xot,
+    node: xot::Node,
+    invocation: xot::Node,
+    context: &Context,
+) -> Result<(), xot::Error> {
+    // <foreachfile.f dir="/blog/" sort="blogpost.date">
+    //     <x />
+    // <foreachfile.f>
+
+    let loop_var_str = xot
+        .name_ns_str(xot.node_name(node).unwrap())
+        .0
+        .strip_prefix("foreachfile.")
+        .unwrap()
+        .to_string();
+
+    assert!(xot.children(node).filter(|c| xot.is_element(*c)).count() == 1);
+
+    let mut dir_attr = xot
+        .attributes(node)
+        .get(
+            xot.name("dir")
+                .expect("foreachfile is missing dir attribute"),
+        )
+        .expect("foreachfile is missing dir attribute")
+        .clone();
+
+    // TODO: prevent '..' escapes?
+    if let Some(stripped) = dir_attr.strip_prefix("/") {
+        dir_attr = stripped.to_string();
+    }
+
+    let mut file_paths = Vec::<PathBuf>::new();
+
+    let dir_path = context.source_root.join(dir_attr);
+    println!("source_root={}", context.source_root.display());
+    println!("dir_path={}", dir_path.display());
+    for dir_ent in read_dir(dir_path).unwrap() {
+        let dir_ent = dir_ent.unwrap();
+        if dir_ent.file_type().unwrap().is_file()
+            && dir_ent.file_name().to_str().unwrap().ends_with(".html")
+        {
+            file_paths.push(dir_ent.path());
+        }
+    }
+
+    println!("files: {:?}", file_paths);
+
+    let node_child = xot
+        .children(node)
+        .filter(|c| xot.is_element(*c))
+        .next()
+        .unwrap();
+
+    for file_path in file_paths {
+        let ch = xot.clone(node_child);
+
+        xot.insert_before(node, ch)?;
+
+        if let Some(path_name_id) = xot.name(&format!("{}.path", loop_var_str)) {
+            // Create a new text node
+            let path_text_node = xot.new_text(
+                file_path
+                    .strip_prefix(&context.source_root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+            );
+
+            substitute_tag(xot, ch, path_name_id, path_text_node, invocation, context)?;
+        }
+
+        // TODO:
+        //  - create inner context with e.g. f.path expression value defined
+        //    (might need to remove 'self.' naming assumption)
+        //  - call expand_all_attr_strings with that context
+    }
+    // xot.remove(node)?;
+    xot.detach(node)?;
+    Ok(())
 }
 
 fn evaluate_expression(xot: &Xot, expr: &str, invocation: xot::Node, context: &Context) -> String {
@@ -412,6 +504,11 @@ fn substitute_invocation(
         return substitute_foreachchild(xot, node, invocation, context);
     }
 
+    // substitute <foreachfile.*> tags
+    if elem_name.starts_with("foreachfile.") {
+        return substitute_foreachfile(xot, node, invocation, context);
+    }
+
     // substitute <if> tags
     if elem_name == "if" {
         return substitute_if(xot, node, invocation, context);
@@ -579,7 +676,7 @@ fn generate_file(
             .to_string_lossy()
             .to_string();
 
-    let context = Context::new(file_path);
+    let context = Context::new(file_path, source_root.to_path_buf());
 
     let children: Vec<xot::Node> = xot.children(document).collect();
     for node in children {
