@@ -5,7 +5,7 @@ use std::{
     fmt::Debug,
     fs::{self, read_dir},
     io, panic,
-    path::{self, PathBuf},
+    path::{self, Path, PathBuf},
 };
 use xot::Xot;
 
@@ -102,21 +102,21 @@ fn minify(xot: &mut Xot, node: xot::Node) -> Result<(), xot::Error> {
 
 // Look for and replace single instances of a named tag with
 // the given replacement
-fn substitute_tag(
+fn substitute_tag<F: FnMut(&mut Xot, xot::Node) -> xot::Node>(
     xot: &mut Xot,
     node: xot::Node,
     tag_name: xot::NameId,
-    replacement: xot::Node,
+    f: &mut F,
     invocation: xot::Node,
     context: &Context,
 ) -> Result<(), xot::Error> {
     debug_assert!(!xot.is_removed(node));
-    debug_assert!(!xot.is_removed(replacement));
+
     let xot::Value::Element(elem) = xot.value(node) else {
         return Ok(());
     };
     if elem.name() == tag_name {
-        let r = xot.clone(replacement);
+        let replacement = f(xot, node);
         // expand and propagate any attributes
         let orig_attrs: Vec<(String, String)> = xot
             .attributes(node)
@@ -134,18 +134,18 @@ fn substitute_tag(
         // results in all attributes on the parent
         // node being cleared. Inserting and then detaching
         // circumvents that.
-        xot.insert_after(node, r)?;
+        xot.insert_after(node, replacement)?;
         xot.detach(node)?;
 
         for (key, value) in orig_attrs {
             let key_id = xot.add_name(&key);
-            xot.attributes_mut(r).insert(key_id, value);
+            xot.attributes_mut(replacement).insert(key_id, value);
         }
         return Ok(());
     }
     let children: Vec<xot::Node> = xot.children(node).collect();
     for child in children {
-        substitute_tag(xot, child, tag_name, replacement, invocation, context)?;
+        substitute_tag(xot, child, tag_name, f, invocation, context)?;
     }
     Ok(())
 }
@@ -188,7 +188,14 @@ fn substitute_foreachchild(
 
         xot.insert_before(node, ch)?;
 
-        substitute_tag(xot, ch, loop_var, inv_child, invocation, context)?;
+        substitute_tag(
+            xot,
+            ch,
+            loop_var,
+            &mut |xot, _| xot.clone(inv_child),
+            invocation,
+            context,
+        )?;
     }
     // xot.remove(node)?;
     xot.detach(node)?;
@@ -202,7 +209,7 @@ fn substitute_foreachfile(
     context: &Context,
 ) -> Result<(), xot::Error> {
     // <foreachfile.f dir="/blog/" sort="blogpost.date">
-    //     <x />
+    //     ...
     // <foreachfile.f>
 
     let loop_var_str = xot
@@ -260,10 +267,27 @@ fn substitute_foreachfile(
         inner_context.define_variable(path_var_name.clone(), path_var_value.to_string());
 
         if let Some(path_name_id) = xot.name(&path_var_name) {
-            // Create a new text node
-            let path_text_node = xot.new_text(path_var_value);
+            substitute_tag(
+                xot,
+                ch,
+                path_name_id,
+                &mut |xot, _| xot.new_text(path_var_value),
+                invocation,
+                context,
+            )?;
+        }
 
-            substitute_tag(xot, ch, path_name_id, path_text_node, invocation, context)?;
+        if let Some(loop_var_id) = xot.name(&loop_var_str) {
+            // TODO: load file contents
+
+            substitute_tag(
+                xot,
+                ch,
+                loop_var_id,
+                &mut |xot, elem| xot.new_text("TODO: replace foreachfile content"),
+                invocation,
+                context,
+            )?;
         }
 
         expand_all_attr_strings(xot, ch, invocation, &inner_context)?;
@@ -534,7 +558,7 @@ struct ElementDefinition {
 }
 
 impl ElementDefinition {
-    fn from_file(xot: &mut Xot, path: &std::path::Path) -> Result<ElementDefinition, io::Error> {
+    fn from_file(xot: &mut Xot, path: &Path) -> Result<ElementDefinition, io::Error> {
         let name = path.file_stem().unwrap().to_str().unwrap().to_string();
         let mut source_text = fs::read_to_string(path)?;
 
