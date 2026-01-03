@@ -16,6 +16,7 @@ struct Context {
     regex_dollar_expansion: Regex,
     regex_or_expr: Regex,
     regex_variable: Regex,
+    regex_tag_attr_pair: Regex,
     source_root: PathBuf,
     variables: HashMap<String, String>,
 }
@@ -25,11 +26,14 @@ impl Context {
         let regex_dollar_expansion = Regex::new(r"\$\{([a-zA-Z0-9_\-\.\|]+)}").unwrap();
         let regex_or_expr = Regex::new(r"^([a-zA-Z0-9_\-\.]+)\|\|([a-zA-Z0-9_\-\.]+)$").unwrap();
         let regex_variable = Regex::new(r"^[a-zA-Z]+\.[a-zA-Z]+$").unwrap();
+        let regex_tag_attr_pair =
+            Regex::new(r"^([a-zA-Z][a-zA-Z0-9]*)\.([a-zA-Z][a-zA-Z0-9]*)$").unwrap();
 
         Context {
             regex_dollar_expansion,
             regex_or_expr,
             regex_variable,
+            regex_tag_attr_pair,
             source_root,
             variables: HashMap::new(),
         }
@@ -212,7 +216,7 @@ fn substitute_foreachfile(
     invocation: xot::Node,
     context: &Context,
 ) -> Result<(), xot::Error> {
-    // <foreachfile.f dir="/blog/" sort="blogpost.date">
+    // <foreachfile.f dir="/blog/" sortby="blogpost.date" max="3">
     //     ...
     // <foreachfile.f>
 
@@ -223,8 +227,6 @@ fn substitute_foreachfile(
         .unwrap()
         .to_string();
 
-    assert!(xot.children(node).filter(|c| xot.is_element(*c)).count() == 1);
-
     let mut dir_attr = xot
         .attributes(node)
         .get(
@@ -233,6 +235,31 @@ fn substitute_foreachfile(
         )
         .expect("foreachfile is missing dir attribute")
         .clone();
+
+    let mut sortyby_tag_attr = None;
+
+    if let Some(sortby_id) = xot.name("sortby") {
+        if let Some(sortby_val) = xot.attributes(node).get(sortby_id) {
+            let Some(captures) = context.regex_tag_attr_pair.captures(sortby_val) else {
+                panic!(
+                    "<foreachfile.*> 'sortby' attribute must be of the form 'tagname.attributename'"
+                );
+            };
+            sortyby_tag_attr = Some((captures[1].to_string(), captures[2].to_string()));
+        }
+    }
+
+    let mut max_count = None;
+
+    if let Some(max_id) = xot.name("max") {
+        if let Some(max_val) = xot.attributes(node).get(max_id) {
+            let Ok(n) = max_val.parse::<usize>() else {
+                panic!("<foreachfile.*> 'max' attribute must be a positive integer");
+            };
+
+            max_count = Some(n);
+        }
+    }
 
     // TODO: prevent '..' escapes?
     if let Some(stripped) = dir_attr.strip_prefix("/") {
@@ -251,55 +278,91 @@ fn substitute_foreachfile(
         }
     }
 
-    let node_child = xot
-        .children(node)
-        .filter(|c| xot.is_element(*c))
-        .next()
-        .unwrap();
+    if let Some((sortby_tag, sortby_attr)) = sortyby_tag_attr {
+        if let (Some(tag_id), Some(attr_id)) = (xot.name(&sortby_tag), xot.name(&sortby_attr)) {
+            file_paths.sort_by_cached_key(|filepath| -> String {
+                let doc = DocumentFragment::from_file(xot, filepath).unwrap();
+                let contents = doc.get_contents_inside_node(xot);
+                for d in xot.all_descendants(contents) {
+                    if xot.node_name(d) == Some(tag_id) {
+                        if let Some(val) = xot.attributes(d).get(attr_id) {
+                            return val.clone();
+                        }
+                    }
+                }
+
+                "".to_string()
+            });
+        }
+    }
+
+    if let Some(n) = max_count {
+        if n < file_paths.len() {
+            file_paths.drain(n..);
+        }
+    }
+
+    let node_children: Vec<xot::Node> = xot.children(node).filter(|c| xot.is_element(*c)).collect();
 
     for file_path in file_paths {
-        let ch = xot.clone(node_child);
+        for node_child in &node_children {
+            let ch = xot.clone(*node_child);
 
-        let path_var_name = format!("{}.path", loop_var_str);
-        let path_var_value = file_path
-            .strip_prefix(&context.source_root)
-            .unwrap()
-            .to_str()
-            .unwrap();
+            let path_var_name = format!("{}.path", loop_var_str);
+            let path_var_value = file_path
+                .strip_prefix(&context.source_root)
+                .unwrap()
+                .to_str()
+                .unwrap();
 
-        let mut inner_context = context.clone();
-        inner_context.define_variable(path_var_name.clone(), path_var_value.to_string());
+            let mut inner_context = context.clone();
+            inner_context.define_variable(path_var_name.clone(), path_var_value.to_string());
 
-        if let Some(path_name_id) = xot.name(&path_var_name) {
-            substitute_tag(
-                xot,
-                ch,
-                path_name_id,
-                &mut |xot, _| vec![xot.new_text(path_var_value)],
-                invocation,
-                context,
-            )?;
+            if let Some(path_name_id) = xot.name(&path_var_name) {
+                substitute_tag(
+                    xot,
+                    ch,
+                    path_name_id,
+                    &mut |xot, _| vec![xot.new_text(path_var_value)],
+                    invocation,
+                    context,
+                )?;
+            }
+
+            if let Some(loop_var_id) = xot.name(&loop_var_str) {
+                let file_contents = DocumentFragment::from_file(xot, &file_path).unwrap();
+
+                substitute_tag(
+                    xot,
+                    ch,
+                    loop_var_id,
+                    &mut |xot, elem| {
+                        let contents = file_contents.get_contents_inside_node(xot);
+
+                        if let Some(excerpttag_id) = xot.name("excerpttag") {
+                            if let Some(excerpttag_value) = xot.attributes(elem).get(excerpttag_id)
+                            {
+                                if let Some(excerpttag_name_id) = xot.name(excerpttag_value) {
+                                    for d in xot.all_descendants(contents) {
+                                        if xot.node_name(d) == Some(excerpttag_name_id) {
+                                            return vec![d];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        xot.children(contents).collect()
+                    },
+                    invocation,
+                    context,
+                )?;
+            }
+
+            expand_all_attr_strings(xot, ch, invocation, &inner_context)?;
+
+            xot.insert_before(node, ch)?;
         }
-
-        if let Some(loop_var_id) = xot.name(&loop_var_str) {
-            let file_contents = DocumentFragment::from_file(xot, &file_path).unwrap();
-
-            substitute_tag(
-                xot,
-                ch,
-                loop_var_id,
-                &mut |xot, elem| {
-                    let contents = file_contents.get_contents_inside_node(xot);
-                    xot.children(contents).collect()
-                },
-                invocation,
-                context,
-            )?;
-        }
-
-        expand_all_attr_strings(xot, ch, invocation, &inner_context)?;
-
-        xot.insert_before(node, ch)?;
     }
     // xot.remove(node)?;
     xot.detach(node)?;
