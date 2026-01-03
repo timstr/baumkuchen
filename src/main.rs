@@ -102,7 +102,7 @@ fn minify(xot: &mut Xot, node: xot::Node) -> Result<(), xot::Error> {
 
 // Look for and replace single instances of a named tag with
 // the given replacement
-fn substitute_tag<F: FnMut(&mut Xot, xot::Node) -> xot::Node>(
+fn substitute_tag<F: FnMut(&mut Xot, xot::Node) -> Vec<xot::Node>>(
     xot: &mut Xot,
     node: xot::Node,
     tag_name: xot::NameId,
@@ -134,12 +134,16 @@ fn substitute_tag<F: FnMut(&mut Xot, xot::Node) -> xot::Node>(
         // results in all attributes on the parent
         // node being cleared. Inserting and then detaching
         // circumvents that.
-        xot.insert_after(node, replacement)?;
+        for r in &replacement {
+            xot.insert_after(node, *r)?;
+        }
         xot.detach(node)?;
 
-        for (key, value) in orig_attrs {
-            let key_id = xot.add_name(&key);
-            xot.attributes_mut(replacement).insert(key_id, value);
+        if let [replacement] = &replacement[..] {
+            for (key, value) in orig_attrs {
+                let key_id = xot.add_name(&key);
+                xot.attributes_mut(*replacement).insert(key_id, value);
+            }
         }
         return Ok(());
     }
@@ -192,7 +196,7 @@ fn substitute_foreachchild(
             xot,
             ch,
             loop_var,
-            &mut |xot, _| xot.clone(inv_child),
+            &mut |xot, _| vec![xot.clone(inv_child)],
             invocation,
             context,
         )?;
@@ -271,20 +275,23 @@ fn substitute_foreachfile(
                 xot,
                 ch,
                 path_name_id,
-                &mut |xot, _| xot.new_text(path_var_value),
+                &mut |xot, _| vec![xot.new_text(path_var_value)],
                 invocation,
                 context,
             )?;
         }
 
         if let Some(loop_var_id) = xot.name(&loop_var_str) {
-            // TODO: load file contents
+            let file_contents = DocumentFragment::from_file(xot, &file_path).unwrap();
 
             substitute_tag(
                 xot,
                 ch,
                 loop_var_id,
-                &mut |xot, elem| xot.new_text("TODO: replace foreachfile content"),
+                &mut |xot, elem| {
+                    let contents = file_contents.get_contents_inside_node(xot);
+                    xot.children(contents).collect()
+                },
                 invocation,
                 context,
             )?;
@@ -552,14 +559,12 @@ fn substitute_invocation(
     Ok(())
 }
 
-struct ElementDefinition {
-    tag_name: xot::NameId,
-    node: xot::Node,
+struct DocumentFragment {
+    root_node: xot::Node,
 }
 
-impl ElementDefinition {
-    fn from_file(xot: &mut Xot, path: &Path) -> Result<ElementDefinition, io::Error> {
-        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+impl DocumentFragment {
+    fn from_file(xot: &mut Xot, path: &Path) -> Result<DocumentFragment, io::Error> {
         let mut source_text = fs::read_to_string(path)?;
 
         // Wrap the document root in a throwaway node because document roots
@@ -568,7 +573,7 @@ impl ElementDefinition {
         source_text.insert_str(0, "<throwaway>");
         source_text.push_str("</throwaway>");
 
-        let document = xot.parse(&source_text).unwrap_or_else(|err| {
+        let root_node = xot.parse(&source_text).unwrap_or_else(|err| {
             panic!(
                 "Failed to parse element definition at {}: {}",
                 path.display(),
@@ -576,9 +581,38 @@ impl ElementDefinition {
             )
         });
 
+        Ok(DocumentFragment { root_node })
+    }
+
+    fn get_contents_inside_node(&self, xot: &mut Xot) -> xot::Node {
+        // unwrap anonymous outer node
+        let node = xot.children(self.root_node).next().unwrap();
+
+        // clone throwaway node
+        let node = xot.clone(node);
+
+        // Return the throwaway node
+        // This is mainly so that the outer throwaway node can be used
+        // for performing substitutions on the children without
+        // losing track of what those children are.
+        node
+    }
+}
+
+struct ElementDefinition {
+    tag_name: xot::NameId,
+    document: DocumentFragment,
+}
+
+impl ElementDefinition {
+    fn from_file(xot: &mut Xot, path: &Path) -> Result<ElementDefinition, io::Error> {
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+
+        let document = DocumentFragment::from_file(xot, path)?;
+
         Ok(ElementDefinition {
             tag_name: xot.add_name(&name),
-            node: document,
+            document,
         })
     }
 
@@ -592,11 +626,6 @@ impl ElementDefinition {
         invocation: xot::Node,
         context: &Context,
     ) -> Result<Vec<xot::Node>, xot::Error> {
-        // unwrap <throwaway> node
-        let node = xot.children(self.node).next().unwrap();
-
-        let node = xot.clone(node);
-
         // create nested context with variables defined by attributes on the invocation
         let mut inner_context = context.clone();
 
@@ -605,10 +634,12 @@ impl ElementDefinition {
             inner_context.define_variable(format!("self.{}", attr_name), attr_value.clone());
         }
 
-        substitute_invocation(xot, node, invocation, &inner_context)?;
-        expand_all_attr_strings(xot, node, invocation, &inner_context)?;
+        let outer_node = self.document.get_contents_inside_node(xot);
 
-        Ok(xot.children(node).collect())
+        substitute_invocation(xot, outer_node, invocation, &inner_context)?;
+        expand_all_attr_strings(xot, outer_node, invocation, &inner_context)?;
+
+        Ok(xot.children(outer_node).collect())
     }
 }
 
