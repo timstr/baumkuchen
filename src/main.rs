@@ -16,7 +16,7 @@ struct Context {
     regex_dollar_expansion: Regex,
     regex_or_expr: Regex,
     regex_variable: Regex,
-    regex_tag_attr_pair: Regex,
+    regex_sort_key: Regex,
     source_root: PathBuf,
     variables: HashMap<String, String>,
 }
@@ -26,14 +26,14 @@ impl Context {
         let regex_dollar_expansion = Regex::new(r"\$\{([a-zA-Z0-9_\-\.\|]+)}").unwrap();
         let regex_or_expr = Regex::new(r"^([a-zA-Z0-9_\-\.]+)\|\|([a-zA-Z0-9_\-\.]+)$").unwrap();
         let regex_variable = Regex::new(r"^[a-zA-Z]+\.[a-zA-Z]+$").unwrap();
-        let regex_tag_attr_pair =
-            Regex::new(r"^([a-zA-Z][a-zA-Z0-9]*)\.([a-zA-Z][a-zA-Z0-9]*)$").unwrap();
+        let regex_sort_key =
+            Regex::new(r"^(-?)([a-zA-Z][a-zA-Z0-9]*)\.([a-zA-Z][a-zA-Z0-9]*)$").unwrap();
 
         Context {
             regex_dollar_expansion,
             regex_or_expr,
             regex_variable,
-            regex_tag_attr_pair,
+            regex_sort_key,
             source_root,
             variables: HashMap::new(),
         }
@@ -98,7 +98,7 @@ fn minify(xot: &mut Xot, node: xot::Node) -> Result<(), xot::Error> {
 
     let children: Vec<xot::Node> = xot.children(node).collect();
     for child in &children {
-        minify(xot, *child)?;
+        minify(xot, *child).expect("Failed to minify");
     }
 
     Ok(())
@@ -139,9 +139,11 @@ fn substitute_tag<F: FnMut(&mut Xot, xot::Node) -> Vec<xot::Node>>(
         // node being cleared. Inserting and then detaching
         // circumvents that.
         for r in &replacement {
-            xot.insert_after(node, *r)?;
+            xot.insert_after(node, *r)
+                .expect("Failed to insert replacement node during substitution");
         }
-        xot.detach(node)?;
+        xot.detach(node)
+            .expect("Failed to detach node being replaced");
 
         if let [replacement] = &replacement[..] {
             for (key, value) in orig_attrs {
@@ -194,7 +196,8 @@ fn substitute_foreachchild(
         }
         let ch = xot.clone(node_child);
 
-        xot.insert_before(node, ch)?;
+        xot.insert_before(node, ch)
+            .expect("Failed to insert substituted node");
 
         substitute_tag(
             xot,
@@ -206,7 +209,8 @@ fn substitute_foreachchild(
         )?;
     }
     // xot.remove(node)?;
-    xot.detach(node)?;
+    xot.detach(node)
+        .expect("Failed to detach node after substituting");
     return Ok(());
 }
 
@@ -216,7 +220,7 @@ fn substitute_foreachfile(
     invocation: xot::Node,
     context: &Context,
 ) -> Result<(), xot::Error> {
-    // <foreachfile.f dir="/blog/" sortby="blogpost.date" max="3">
+    // <foreachfile.f dir="/blog/" sortby="-blogpost.date" max="3">
     //     ...
     // <foreachfile.f>
 
@@ -237,15 +241,17 @@ fn substitute_foreachfile(
         .clone();
 
     let mut sortyby_tag_attr = None;
+    let mut reverse = false;
 
     if let Some(sortby_id) = xot.name("sortby") {
         if let Some(sortby_val) = xot.attributes(node).get(sortby_id) {
-            let Some(captures) = context.regex_tag_attr_pair.captures(sortby_val) else {
+            let Some(captures) = context.regex_sort_key.captures(sortby_val) else {
                 panic!(
                     "<foreachfile.*> 'sortby' attribute must be of the form 'tagname.attributename'"
                 );
             };
-            sortyby_tag_attr = Some((captures[1].to_string(), captures[2].to_string()));
+            reverse = &captures[1] == "-";
+            sortyby_tag_attr = Some((captures[2].to_string(), captures[3].to_string()));
         }
     }
 
@@ -293,6 +299,10 @@ fn substitute_foreachfile(
 
                 "".to_string()
             });
+        }
+
+        if reverse {
+            file_paths.reverse();
         }
     }
 
@@ -349,6 +359,8 @@ fn substitute_foreachfile(
                                         }
                                     }
                                 }
+
+                                return vec![];
                             }
                         }
 
@@ -361,11 +373,13 @@ fn substitute_foreachfile(
 
             expand_all_attr_strings(xot, ch, invocation, &inner_context)?;
 
-            xot.insert_before(node, ch)?;
+            xot.insert_before(node, ch)
+                .expect("Failed to insert node during substitution");
         }
     }
     // xot.remove(node)?;
-    xot.detach(node)?;
+    xot.detach(node)
+        .expect("Failed to detach node after substitution");
     Ok(())
 }
 
@@ -486,7 +500,7 @@ fn substitute_if(
             let children: Vec<xot::Node> = xot.children(node_then).collect();
             for ch in children {
                 let ch = xot.clone(ch);
-                xot.insert_before(node, ch)?;
+                xot.insert_before(node, ch).expect("Failed to insert node");
             }
         }
         xot.remove(node)
@@ -496,7 +510,7 @@ fn substitute_if(
             let children: Vec<xot::Node> = xot.children(node_else).collect();
             for ch in children {
                 let ch = xot.clone(ch);
-                xot.insert_before(node, ch)?;
+                xot.insert_before(node, ch).expect("Failed to insert node");
             }
         }
         xot.remove(node)
@@ -519,9 +533,9 @@ fn substitute_attr(
         let children: Vec<xot::Node> = xot.children(invocation).collect();
         for ch in children {
             let r = xot.clone(ch);
-            xot.insert_before(node, r)?;
+            xot.insert_before(node, r).expect("Failed to insert node");
         }
-        xot.remove(node)?;
+        xot.remove(node).expect("Failed to remove node");
 
         return Ok(());
     }
@@ -538,10 +552,10 @@ fn substitute_attr(
         // replace tags <self.xyz> with attribute value xyz if defined
         if !attr_val.is_empty() {
             let r = xot.new_text(&attr_val);
-            xot.insert_before(node, r)?;
+            xot.insert_before(node, r).expect("Failed to insert node");
         }
         // xot.remove(node)?;
-        xot.detach(node)?;
+        xot.detach(node).expect("Failed to detach node");
     }
 
     Ok(())
@@ -745,6 +759,9 @@ fn substitute(
 
     let mut did_anything = false;
 
+    // TODO: this fails when an output file's root element is being
+    // substituted. Add a workaround for that.
+
     if let Some(element_defn) = library.elements().get(&element_name) {
         let instantiation = element_defn
             .instantiate(xot, node, context)
@@ -752,10 +769,11 @@ fn substitute(
         for inst_node in instantiation {
             debug_assert!(!xot.is_removed(node));
             debug_assert!(!xot.is_removed(inst_node));
-            xot.insert_before(node, inst_node)?;
+            xot.insert_before(node, inst_node)
+                .expect("Failed to insert node");
         }
         // xot.remove(node)?;
-        xot.detach(node)?;
+        xot.detach(node).expect("Failed to detach node");
         did_anything = true;
     }
 
