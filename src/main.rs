@@ -220,7 +220,7 @@ fn substitute_foreachfile(
     invocation: xot::Node,
     context: &Context,
 ) -> Result<(), xot::Error> {
-    // <foreachfile.f dir="/blog/" sortby="-blogpost.date" max="3">
+    // <foreachfile.f dir="/blog/" sortby="-blogpost.date" max="3" exclude="hidden.html">
     //     ...
     // <foreachfile.f>
 
@@ -267,6 +267,14 @@ fn substitute_foreachfile(
         }
     }
 
+    let mut exclusions = Vec::new();
+
+    if let Some(exclude_id) = xot.name("exclude") {
+        if let Some(exclude_val) = xot.attributes(node).get(exclude_id) {
+            exclusions = exclude_val.split(",").map(str::to_string).collect();
+        }
+    }
+
     // TODO: prevent '..' escapes?
     if let Some(stripped) = dir_attr.strip_prefix("/") {
         dir_attr = stripped.to_string();
@@ -277,9 +285,12 @@ fn substitute_foreachfile(
     let dir_path = context.source_root.join(dir_attr);
     for dir_ent in read_dir(dir_path).unwrap() {
         let dir_ent = dir_ent.unwrap();
-        if dir_ent.file_type().unwrap().is_file()
-            && dir_ent.file_name().to_str().unwrap().ends_with(".html")
-        {
+        let file_name = dir_ent.file_name();
+        let file_name = file_name.to_str().unwrap();
+        if dir_ent.file_type().unwrap().is_file() && file_name.ends_with(".html") {
+            if exclusions.iter().any(|s| s == file_name) {
+                continue;
+            }
             file_paths.push(dir_ent.path());
         }
     }
@@ -319,11 +330,13 @@ fn substitute_foreachfile(
             let ch = xot.clone(*node_child);
 
             let path_var_name = format!("{}.path", loop_var_str);
-            let path_var_value = file_path
+            let mut path_var_value = file_path
                 .strip_prefix(&context.source_root)
                 .unwrap()
                 .to_str()
-                .unwrap();
+                .unwrap()
+                .to_string();
+            path_var_value.insert(0, '/');
 
             let mut inner_context = context.clone();
             inner_context.define_variable(path_var_name.clone(), path_var_value.to_string());
@@ -333,7 +346,7 @@ fn substitute_foreachfile(
                     xot,
                     ch,
                     path_name_id,
-                    &mut |xot, _| vec![xot.new_text(path_var_value)],
+                    &mut |xot, _| vec![xot.new_text(&path_var_value)],
                     invocation,
                     context,
                 )?;
