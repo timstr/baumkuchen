@@ -11,8 +11,7 @@ use xot::Xot;
 
 #[derive(Clone)]
 struct Context {
-    // path of the document currently being generated, relative
-    // to the root of the source directory
+    path: PathBuf,
     regex_dollar_expansion: Regex,
     regex_or_expr: Regex,
     regex_variable: Regex,
@@ -22,7 +21,7 @@ struct Context {
 }
 
 impl Context {
-    fn new(source_root: PathBuf) -> Context {
+    fn new(path: PathBuf, source_root: PathBuf) -> Context {
         let regex_dollar_expansion = Regex::new(r"\$\{([a-zA-Z0-9_\-\.\|]+)}").unwrap();
         let regex_or_expr = Regex::new(r"^([a-zA-Z0-9_\-\.]+)\|\|([a-zA-Z0-9_\-\.]+)$").unwrap();
         let regex_variable = Regex::new(r"^[a-zA-Z]+\.[a-zA-Z]+$").unwrap();
@@ -30,6 +29,7 @@ impl Context {
             Regex::new(r"^(-?)([a-zA-Z][a-zA-Z0-9]*)\.([a-zA-Z][a-zA-Z0-9]*)$").unwrap();
 
         Context {
+            path,
             regex_dollar_expansion,
             regex_or_expr,
             regex_variable,
@@ -214,13 +214,19 @@ fn substitute_foreachchild(
     return Ok(());
 }
 
+enum FileSortKey {
+    Name,
+    Date,
+    HTMLTagAttr { tag: String, attr: String },
+}
+
 fn substitute_foreachfile(
     xot: &mut Xot,
     node: xot::Node,
     invocation: xot::Node,
     context: &Context,
 ) -> Result<(), xot::Error> {
-    // <foreachfile.f dir="/blog/" sortby="-blogpost.date" max="3" exclude="hidden.html">
+    // <foreachfile.f dir="/blog/" ext="html" sortby="-blogpost.date" max="3" exclude="hidden.html">
     //     ...
     // <foreachfile.f>
 
@@ -231,7 +237,7 @@ fn substitute_foreachfile(
         .unwrap()
         .to_string();
 
-    let mut dir_attr = xot
+    let dir_attr = xot
         .attributes(node)
         .get(
             xot.name("dir")
@@ -240,18 +246,38 @@ fn substitute_foreachfile(
         .expect("foreachfile is missing dir attribute")
         .clone();
 
-    let mut sortyby_tag_attr = None;
+    let mut ext_attr = None;
+
+    if let Some(ext_id) = xot.name("ext") {
+        if let Some(ext_val) = xot.attributes(node).get(ext_id) {
+            ext_attr = Some(".".to_string() + &ext_val.to_lowercase());
+        }
+    }
+
+    let mut sortkey = FileSortKey::Name;
     let mut reverse = false;
 
     if let Some(sortby_id) = xot.name("sortby") {
         if let Some(sortby_val) = xot.attributes(node).get(sortby_id) {
-            let Some(captures) = context.regex_sort_key.captures(sortby_val) else {
+            let mut sortby_val = sortby_val.clone();
+            if let Some(s) = sortby_val.strip_prefix("-") {
+                sortby_val = s.to_string();
+                reverse = true;
+            }
+            if sortby_val == "name" {
+                sortkey = FileSortKey::Name;
+            } else if sortby_val == "date" {
+                sortkey = FileSortKey::Date;
+            } else if let Some(captures) = context.regex_sort_key.captures(&sortby_val) {
+                sortkey = FileSortKey::HTMLTagAttr {
+                    tag: captures[1].to_string(),
+                    attr: captures[2].to_string(),
+                };
+            } else {
                 panic!(
-                    "<foreachfile.*> 'sortby' attribute must be of the form 'tagname.attributename'"
+                    "<foreachfile.*> 'sortby' attribute must one of 'name', 'date', or '[tagname].[attributename]'"
                 );
-            };
-            reverse = &captures[1] == "-";
-            sortyby_tag_attr = Some((captures[2].to_string(), captures[3].to_string()));
+            }
         }
     }
 
@@ -275,19 +301,36 @@ fn substitute_foreachfile(
         }
     }
 
-    // TODO: prevent '..' escapes?
-    if let Some(stripped) = dir_attr.strip_prefix("/") {
-        dir_attr = stripped.to_string();
-    }
-
     let mut file_paths = Vec::<PathBuf>::new();
 
-    let dir_path = context.source_root.join(dir_attr);
-    for dir_ent in read_dir(dir_path).unwrap() {
+    let dir_path = if dir_attr.starts_with("/") {
+        context
+            .source_root
+            .join(dir_attr.strip_prefix("/").unwrap())
+    } else {
+        context.path.parent().unwrap().join(dir_attr.clone())
+    };
+    for dir_ent in read_dir(dir_path.clone()).unwrap_or_else(|e| {
+        println!("dir_attr={}", dir_attr);
+        println!("source_root={}", context.source_root.display());
+        println!("path={}", context.path.display());
+        panic!(
+            "Couldn't read foreachfile directory {:?} at {:?} (resolved as {}): {}",
+            dir_attr,
+            context.source_root,
+            dir_path.display(),
+            e
+        )
+    }) {
         let dir_ent = dir_ent.unwrap();
         let file_name = dir_ent.file_name();
         let file_name = file_name.to_str().unwrap();
-        if dir_ent.file_type().unwrap().is_file() && file_name.ends_with(".html") {
+        if dir_ent.file_type().unwrap().is_file() {
+            if let Some(ext) = &ext_attr {
+                if !file_name.to_lowercase().ends_with(ext) {
+                    continue;
+                }
+            }
             if exclusions.iter().any(|s| s == file_name) {
                 continue;
             }
@@ -295,15 +338,23 @@ fn substitute_foreachfile(
         }
     }
 
-    if let Some((sortby_tag, sortby_attr)) = sortyby_tag_attr {
-        if let (Some(tag_id), Some(attr_id)) = (xot.name(&sortby_tag), xot.name(&sortby_attr)) {
+    match sortkey {
+        FileSortKey::Name => {
+            file_paths.sort_by(|l, r| l.file_name().unwrap().cmp(r.file_name().unwrap()));
+        }
+        FileSortKey::Date => {
+            file_paths.sort_by_cached_key(|p| std::fs::metadata(p).unwrap().modified().unwrap());
+        }
+        FileSortKey::HTMLTagAttr { tag, attr } => {
             file_paths.sort_by_cached_key(|filepath| -> String {
                 let doc = DocumentFragment::from_file(xot, filepath).unwrap();
-                let contents = doc.get_contents_inside_node(xot);
-                for d in xot.all_descendants(contents) {
-                    if xot.node_name(d) == Some(tag_id) {
-                        if let Some(val) = xot.attributes(d).get(attr_id) {
-                            return val.clone();
+                if let (Some(tag_id), Some(attr_id)) = (xot.name(&tag), xot.name(&attr)) {
+                    let contents = doc.get_contents_inside_node(xot);
+                    for d in xot.all_descendants(contents) {
+                        if xot.node_name(d) == Some(tag_id) {
+                            if let Some(val) = xot.attributes(d).get(attr_id) {
+                                return val.clone();
+                            }
                         }
                     }
                 }
@@ -311,10 +362,10 @@ fn substitute_foreachfile(
                 "".to_string()
             });
         }
+    }
 
-        if reverse {
-            file_paths.reverse();
-        }
+    if reverse {
+        file_paths.reverse();
     }
 
     if let Some(n) = max_count {
@@ -329,17 +380,33 @@ fn substitute_foreachfile(
         for node_child in &node_children {
             let ch = xot.clone(*node_child);
 
-            let path_var_name = format!("{}.path", loop_var_str);
-            let mut path_var_value = file_path
-                .strip_prefix(&context.source_root)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
-            path_var_value.insert(0, '/');
-
             let mut inner_context = context.clone();
+
+            let path_var_name = format!("{}.path", loop_var_str);
+            let path_var_value = if dir_attr.starts_with("/") {
+                let mut p = file_path
+                    .strip_prefix(&context.source_root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                p.insert(0, '/');
+                p
+            } else {
+                file_path
+                    .strip_prefix(context.path.parent().unwrap())
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            };
+
             inner_context.define_variable(path_var_name.clone(), path_var_value.to_string());
+
+            let name_var_name = format!("{}.name", loop_var_str);
+            let name_var_val = file_path.file_name().unwrap().to_str().unwrap();
+
+            inner_context.define_variable(name_var_name.clone(), name_var_val.to_string());
 
             if let Some(path_name_id) = xot.name(&path_var_name) {
                 substitute_tag(
@@ -744,7 +811,7 @@ impl ElementLibrary {
             let entry = entry?;
             let entry_path = entry.path();
             if let Some(ext) = entry_path.extension() {
-                if ext == "html" {
+                if ["html", "xml"].iter().any(|s| *s == ext) {
                     let element_defn = ElementDefinition::from_file(xot, &entry_path)?;
                     let prev = elements.insert(element_defn.tag_name(), element_defn);
                     assert!(prev.is_none());
@@ -824,13 +891,9 @@ fn generate_file(
     // }
 
     let source_text = fs::read_to_string(source_path)?;
-    let document = xot.parse(&source_text).unwrap_or_else(|err| {
-        panic!(
-            "Failed to parse html file at {}: {}",
-            source_path.display(),
-            err
-        )
-    });
+    let document = xot
+        .parse(&source_text)
+        .unwrap_or_else(|err| panic!("Failed to parse file at {}: {}", source_path.display(), err));
 
     let file_path = "/".to_string()
         + &source_path
@@ -839,7 +902,7 @@ fn generate_file(
             .to_string_lossy()
             .to_string();
 
-    let mut context = Context::new(source_root.to_path_buf());
+    let mut context = Context::new(source_path.to_path_buf(), source_root.to_path_buf());
     context.define_variable("self.filepath".to_string(), file_path);
 
     let children: Vec<xot::Node> = xot.children(document).collect();
@@ -849,18 +912,32 @@ fn generate_file(
 
     minify(xot, document).expect("Failed to minify document");
 
-    let generated_html = xot
-        .html5()
-        .serialize_string(
-            xot::output::html5::Parameters {
-                indentation: None,
-                cdata_section_elements: vec![],
-            },
-            document,
-        )
-        .expect("Failed to serialize html");
+    let generated_content = match source_path.extension().unwrap().to_str().unwrap() {
+        "html" => xot
+            .html5()
+            .serialize_string(
+                xot::output::html5::Parameters {
+                    indentation: None,
+                    cdata_section_elements: vec![],
+                },
+                document,
+            )
+            .expect("Failed to serialize html"),
+        "xml" => xot
+            .serialize_xml_string(
+                xot::output::xml::Parameters {
+                    indentation: None,
+                    cdata_section_elements: vec![],
+                    declaration: None,
+                    doctype: None,
+                },
+                document,
+            )
+            .expect("Failed to serialize xml"),
+        ext => panic!("Unrecognized file extension: {}", ext),
+    };
 
-    fs::write(dst_path, generated_html)?;
+    fs::write(dst_path, generated_content)?;
 
     // remove document node to free memory (hopefully?)
     xot.remove(document).expect("Failed to remove document");
@@ -928,7 +1005,7 @@ fn generate_folder(
             )?;
         } else if entry_type.is_file() {
             if let Some(ext) = entry_path.extension() {
-                if ext == "html" {
+                if ["html", "xml"].iter().any(|s| *s == ext) {
                     generate_file(
                         xot,
                         source_root,
