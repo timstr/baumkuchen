@@ -270,8 +270,8 @@ fn substitute_foreachfile(
                 sortkey = FileSortKey::Date;
             } else if let Some(captures) = context.regex_sort_key.captures(&sortby_val) {
                 sortkey = FileSortKey::HTMLTagAttr {
-                    tag: captures[1].to_string(),
-                    attr: captures[2].to_string(),
+                    tag: captures[2].to_string(),
+                    attr: captures[3].to_string(),
                 };
             } else {
                 panic!(
